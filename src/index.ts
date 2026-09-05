@@ -7,63 +7,58 @@ const MARKETPLACE_ID = "ATVPDKIKX0DER";
 const SELLER_ID = "A2ZPQEA709W727";
 
 /* ==================================================================
-   v3.0 — 5 September 2026
+   v4.0 — 5 September 2026
 
-   WHAT WAS WRONG IN v2 AND IS FIXED HERE
+   v3 fixed the maths. v4 fills the gaps.
 
-   1. DOUBLE COUNTING. sumAllAmounts() walked every currency field in
-      every event. Several Amazon event types carry BOTH a total AND
-      the components that make up that total. Advertising is the worst
-      case: ProductAdsPaymentEvent has baseValue, taxValue AND
-      transactionValue, where transactionValue = baseValue + taxValue.
-      The blind walk added all three and reported roughly DOUBLE the
-      real spend. That is why 365 days showed $3,616.80 against a
-      lifetime CSV figure of $2,009.55.
-      Same fault applied to CouponPaymentEvent (TotalAmount + its own
-      Fee and Charge components), SellerDealPaymentEvent, AdjustmentEvent
-      and DebtRecoveryEvent.
-      FIX: explicit per-event-type handlers below. The generic walk is
-      now a LAST RESORT for event types Amazon adds later, and anything
-      it touches is flagged approximate: true in the output.
+   NEW IN v4 — six tools, all inside the six roles already approved:
 
-   2. NO DATES. Nothing returned a posted or purchase date, so finding
-      the last sale needed seven separate calls narrowing the window by
-      hand. Every tool now returns real dates.
+     get_traffic_and_conversion  Sessions, page views, UNIT SESSION
+                                 PERCENTAGE (your real conversion rate)
+                                 and Buy Box percentage, per ASIN, per day.
+                                 This number has never been visible before.
+                                 Every plan so far assumed 5% or 8.3%.
+     run_report / get_report     Any SP-API report: returns, reimbursements,
+                                 inventory ledger, Search Query Performance,
+                                 estimated fees. Create-then-poll with GZIP
+                                 decompression handled inside the Worker.
+     get_competitive_pricing     Buy Box owner, lowest offer, offer count.
+     estimate_fees               Referral + FBA fee for ANY price and ANY
+                                 weight/dimensions, before you list.
+                                 This settles Gate 2 without guessing.
+     get_inbound_shipments       Track the 50 copper bottles in transit.
+     get_sales_metrics           Units and revenue by day/week/month.
 
-   3. UNRELIABLE LONG WINDOWS. Amazon's own documentation warns that
-      listFinancialEvents with PostedAfter can return incomplete results
-      over wide date ranges, and the API returns NextToken = null anyway
-      so nothing detects it. That is why 430 days returned FEWER events
-      than 365 days and dropped the Wooden Tong SKU entirely.
-      FIX: by_settlement mode walks financialEventGroups and pulls
-      events per group, which is the route Amazon documents as complete.
-      Auto-warns whenever days > 90 and by_settlement is off.
+   WHY REPORTS ARE TWO TOOLS, NOT ONE
+   Amazon generates a report asynchronously. It can take 30 seconds or
+   ten minutes. A single tool that waits would time out and look broken.
+   run_report waits up to ~55s and returns the data if ready, or a
+   report_id. get_report(report_id) picks it up afterwards.
 
-   4. MISLABELLED CURRENCY. converted_total_usd was never USD. It is the
-      disbursement currency, GBP for this account, at roughly 0.728.
-      Now reported with its real currency code.
+   STILL IMPOSSIBLE, WHATEVER THE CODE DOES
+     Clicks, CPC, impressions, ACOS, keyword spend  → Amazon Ads API,
+       a SEPARATE application. Not obtainable here at any price.
+     Account Health score, reviews, star ratings, buyer messages
+       → not exposed by SP-API at all.
+     Landed cost → Amazon never knows what you paid your supplier.
+     Deposit method settings → Seller Central screen only. This is why
+       the stuck CAD 37.40 must be fixed by hand.
 
-   5. get_settlements DID NOT PAGINATE. One call, 100 groups max. Fine
-      at 63 groups today, silently wrong later.
-
-   6. PER-SKU NET EXCLUDED ADS AND STORAGE. net_after_amazon_usd only
-      subtracted referral, FBA, promos and refunds, so every per-unit
-      figure read better than reality. Now labelled explicitly and a
-      true account-level net is reported alongside it.
+   CARRIED OVER FROM v3
+     Explicit per-event maths, no double counting (ads were 2x in v2).
+     by_settlement mode for complete financial data.
+     Real dates everywhere. Currency codes on settlements.
+     Hard error above 720 days instead of a fake $0.00.
    ================================================================== */
 
-// Landed cost per unit in USD. Amazon never knows what you paid the supplier,
-// so contribution margin is only as honest as what is typed here.
 const COGS: Record<string, number> = {
-	// Copper bottle. $14.00 is the supplier's all-in DDP claim and is NOT yet
-	// verified. Honest arithmetic at $6.78 FOB puts 50 units by air at $18.17,
-	// and US duty on copper alone is roughly $3.60/unit. If the real figure is
-	// $18.17, every contribution number below is overstated by $4.17 a unit.
-	// Correct this the moment the supplier sends an itemised breakdown.
+	// $14.00 is the supplier's unverified all-in DDP claim. Honest air-freight
+	// arithmetic at $6.78 FOB puts 50 units at $18.17, and US duty on copper
+	// alone is roughly $3.60/unit. Correct this the moment an itemised
+	// breakdown arrives.
 	"AH-COPPER-1L": 14.0,
 };
 
-// Amazon's Finances API rejects a PostedAfter older than two years.
 const MAX_FINANCE_DAYS = 720;
 
 let currentEnv: any = null;
@@ -99,16 +94,17 @@ async function getAccessToken(): Promise<string> {
 	return cachedToken as string;
 }
 
-async function spGet(path: string): Promise<any> {
+async function spRequest(method: string, path: string, body?: any): Promise<any> {
 	const token = await getAccessToken();
 
-	// SP-API throttles hard. Retry on 429 and 5xx with a short backoff.
 	for (let attempt = 0; attempt < 4; attempt++) {
 		const res = await fetch(SP_HOST + path, {
+			method,
 			headers: {
 				"x-amz-access-token": token,
 				"Content-Type": "application/json",
 			},
+			body: body ? JSON.stringify(body) : undefined,
 		});
 
 		if (res.status === 429 || res.status >= 500) {
@@ -118,11 +114,14 @@ async function spGet(path: string): Promise<any> {
 
 		const text = await res.text();
 		if (!res.ok) throw new Error("SP-API " + res.status + ": " + text.slice(0, 400));
-		return JSON.parse(text);
+		return text ? JSON.parse(text) : {};
 	}
 
 	throw new Error("SP-API throttled after 4 attempts");
 }
+
+const spGet = (path: string) => spRequest("GET", path);
+const spPost = (path: string, body: any) => spRequest("POST", path, body);
 
 /* ------------------------------------------------------------------ */
 /*  HELPERS                                                            */
@@ -144,21 +143,17 @@ function errorResult(e: any) {
 	return { content: [{ type: "text" as const, text: "Error: " + (e?.message || String(e)) }] };
 }
 
-/** Pulls a currency amount out of any of the shapes Amazon uses. */
 function amountOf(node: any): number {
 	if (!node || typeof node !== "object") return 0;
-	const v =
-		node.CurrencyAmount ?? node.Amount ?? node.amount ?? node.currencyAmount ?? null;
+	const v = node.CurrencyAmount ?? node.Amount ?? node.amount ?? node.currencyAmount ?? null;
 	return v === null ? 0 : Number(v) || 0;
 }
 
-/** Currency code out of any of the shapes Amazon uses. */
 function currencyOf(node: any): string {
 	if (!node || typeof node !== "object") return "";
 	return node.CurrencyCode ?? node.currencyCode ?? "";
 }
 
-/** Sums a list of {SomethingAmount} objects under the given field names. */
 function sumFields(list: any[], fields: string[]): number {
 	let t = 0;
 	for (const item of list || []) {
@@ -169,30 +164,17 @@ function sumFields(list: any[], fields: string[]): number {
 	return t;
 }
 
-/** Posted date out of any of the shapes Amazon uses. */
 function dateOf(node: any): string | null {
 	if (!node || typeof node !== "object") return null;
 	return node.PostedDate ?? node.postedDate ?? node.FundTransferDate ?? null;
 }
 
-/**
- * LAST RESORT ONLY. Used for event types this file does not know about,
- * so a new Amazon event type is still visible rather than silently dropped.
- * Anything summed this way is reported with approximate: true, because a
- * blind walk cannot tell a total apart from the components of that total.
- */
 function sumAllAmountsUnsafe(node: any, depth = 0): number {
 	if (!node || depth > 14) return 0;
-
-	if (Array.isArray(node)) {
-		return node.reduce((t, n) => t + sumAllAmountsUnsafe(n, depth + 1), 0);
-	}
-
+	if (Array.isArray(node)) return node.reduce((t, n) => t + sumAllAmountsUnsafe(n, depth + 1), 0);
 	if (typeof node !== "object") return 0;
-
 	const direct = amountOf(node);
 	if (direct !== 0 && currencyOf(node)) return direct;
-
 	let total = 0;
 	for (const key of Object.keys(node)) {
 		if (key === "PostedDate" || key === "postedDate") continue;
@@ -201,7 +183,6 @@ function sumAllAmountsUnsafe(node: any, depth = 0): number {
 	return total;
 }
 
-/** Human-readable label for an event list key. */
 function prettify(key: string): string {
 	return key
 		.replace(/EventList$/, "")
@@ -210,14 +191,78 @@ function prettify(key: string): string {
 }
 
 /* ------------------------------------------------------------------ */
-/*  EXPLICIT EVENT HANDLERS — the double-counting fix                  */
-/*                                                                     */
-/*  Each returns the NET value of one event. Where Amazon supplies a    */
-/*  total AND its components, only the total is taken.                 */
+/*  REPORTS API — create, poll, download, decompress                   */
+/* ------------------------------------------------------------------ */
+
+/** Cloudflare Workers ship DecompressionStream, so GZIP needs no library. */
+async function downloadReportDocument(documentId: string): Promise<string> {
+	const doc = await spGet("/reports/2021-06-30/documents/" + encodeURIComponent(documentId));
+	const res = await fetch(doc.url);
+	if (!res.ok) throw new Error("Report download failed " + res.status);
+
+	if (doc.compressionAlgorithm === "GZIP") {
+		const stream = res.body!.pipeThrough(new DecompressionStream("gzip"));
+		return await new Response(stream).text();
+	}
+	return await res.text();
+}
+
+/** Turns Amazon's tab-separated reports into objects. */
+function parseTSV(text: string, limit = 500): any[] {
+	const lines = text.split("\n").filter((l) => l.trim().length);
+	if (!lines.length) return [];
+	const headers = lines[0].split("\t").map((h) => h.trim());
+	const rows: any[] = [];
+	for (let i = 1; i < lines.length && rows.length < limit; i++) {
+		const cells = lines[i].split("\t");
+		const row: any = {};
+		headers.forEach((h, j) => (row[h] = (cells[j] ?? "").trim()));
+		rows.push(row);
+	}
+	return rows;
+}
+
+/** Creates a report and waits for it, up to waitSeconds. */
+async function createAndWait(
+	reportType: string,
+	days: number,
+	reportOptions: any | undefined,
+	waitSeconds: number
+) {
+	const body: any = {
+		reportType,
+		marketplaceIds: [MARKETPLACE_ID],
+		dataStartTime: daysAgoISO(days),
+		dataEndTime: new Date(Date.now() - 60000).toISOString(),
+	};
+	if (reportOptions) body.reportOptions = reportOptions;
+
+	const created = await spPost("/reports/2021-06-30/reports", body);
+	const reportId = created.reportId;
+
+	const deadline = Date.now() + waitSeconds * 1000;
+	let status = "IN_QUEUE";
+	let documentId: string | null = null;
+
+	while (Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 5000));
+		const info = await spGet("/reports/2021-06-30/reports/" + encodeURIComponent(reportId));
+		status = info.processingStatus;
+		if (status === "DONE") {
+			documentId = info.reportDocumentId;
+			break;
+		}
+		if (status === "CANCELLED" || status === "FATAL") break;
+	}
+
+	return { reportId, status, documentId };
+}
+
+/* ------------------------------------------------------------------ */
+/*  EXPLICIT EVENT HANDLERS — the double-counting fix (from v3)        */
 /* ------------------------------------------------------------------ */
 
 const EVENT_HANDLERS: Record<string, (e: any) => number> = {
-	// Sales. No grand total is supplied, so components are summed.
 	ShipmentEventList: (e) => {
 		let t = 0;
 		for (const item of e.ShipmentItemList || []) {
@@ -240,33 +285,20 @@ const EVENT_HANDLERS: Record<string, (e: any) => number> = {
 		return t;
 	},
 
-	// ⚠️ THE BIG ONE. transactionValue already contains baseValue + taxValue.
-	// v2 added all three and roughly doubled every advertising figure.
+	// transactionValue already contains baseValue + taxValue.
+	// v2 added all three and reported roughly DOUBLE the real ad spend.
 	ProductAdsPaymentEventList: (e) => {
 		const total = e.transactionValue ?? e.TransactionValue;
 		if (total !== undefined) return amountOf(total);
-		// Fallback only if Amazon omits the total.
 		return amountOf(e.baseValue ?? e.BaseValue) + amountOf(e.taxValue ?? e.TaxValue);
 	},
 
-	// Storage, subscription, long-term storage, removals, Vine. Components only.
 	ServiceFeeEventList: (e) => sumFields(e.FeeList, ["FeeAmount"]),
-
-	// AdjustmentAmount is the total of AdjustmentItemList. Take the total only.
 	AdjustmentEventList: (e) => amountOf(e.AdjustmentAmount),
+	DebtRecoveryEventList: (e) => amountOf(e.RecoveryAmount) + amountOf(e.OverPaymentCredit),
 
-	// RecoveryAmount is the total of DebtRecoveryItemList. Total only.
-	DebtRecoveryEventList: (e) =>
-		amountOf(e.RecoveryAmount) + amountOf(e.OverPaymentCredit),
-
-	// Liquidation and removal income. No grand total supplied.
 	RemovalShipmentEventList: (e) =>
-		sumFields(e.RemovalShipmentItemList, [
-			"Revenue",
-			"FeeAmount",
-			"TaxAmount",
-			"TaxWithheld",
-		]),
+		sumFields(e.RemovalShipmentItemList, ["Revenue", "FeeAmount", "TaxAmount", "TaxWithheld"]),
 
 	RemovalShipmentAdjustmentEventList: (e) =>
 		sumFields(e.RemovalShipmentItemAdjustmentList, [
@@ -278,21 +310,12 @@ const EVENT_HANDLERS: Record<string, (e: any) => number> = {
 	FBALiquidationEventList: (e) =>
 		amountOf(e.LiquidationProceedsAmount) + amountOf(e.LiquidationFeeAmount),
 
-	// TotalAmount already contains FeeComponent + ChargeComponent.
 	CouponPaymentEventList: (e) => amountOf(e.TotalAmount),
-
-	// totalAmount already contains feeAmount + taxAmount.
-	SellerDealPaymentEventList: (e) =>
-		amountOf(e.totalAmount ?? e.TotalAmount),
-
+	SellerDealPaymentEventList: (e) => amountOf(e.totalAmount ?? e.TotalAmount),
 	SAFETReimbursementEventList: (e) => amountOf(e.ReimbursedAmount),
-
 	ImagingServicesFeeEventList: (e) => sumFields(e.FeeList, ["FeeAmount"]),
-
-	// TotalExpense already contains BaseExpense plus the tax components.
 	AffordabilityExpenseEventList: (e) => amountOf(e.TotalExpense),
 	AffordabilityExpenseReversalEventList: (e) => amountOf(e.TotalExpense),
-
 	RetrochargeEventList: (e) => amountOf(e.BaseTax) + amountOf(e.ShippingTax),
 
 	GuaranteeClaimEventList: (e) => {
@@ -314,9 +337,7 @@ const EVENT_HANDLERS: Record<string, (e: any) => number> = {
 	},
 
 	ServiceProviderCreditEventList: (e) => amountOf(e.TransactionAmount),
-
 	PayWithAmazonEventList: (e) => amountOf(e.TransactionAmount),
-
 	TrialShipmentEventList: (e) => sumFields(e.FeeList, ["FeeAmount"]),
 
 	ShipmentSettleEventList: (e) => {
@@ -334,11 +355,9 @@ const EVENT_HANDLERS: Record<string, (e: any) => number> = {
 };
 
 /* ------------------------------------------------------------------ */
-/*  FINANCIAL EVENT COLLECTION                                         */
+/*  FINANCIAL EVENT COLLECTION (from v3)                               */
 /* ------------------------------------------------------------------ */
 
-/** Pulls FinancialEvents blocks using PostedAfter. Fast, but Amazon does not
- *  guarantee completeness over wide windows. */
 async function collectEventsByDate(days: number) {
 	const base =
 		"/finances/v0/financialEvents?PostedAfter=" +
@@ -368,10 +387,7 @@ async function collectEventsByDate(days: number) {
 	return { groups, pages, hitPageLimit, settlementsRead: 0 };
 }
 
-/** Walks every settlement group in the window and pulls that group's events.
- *  Slower and more calls, but this is the route Amazon documents as complete. */
 async function collectEventsBySettlement(days: number) {
-	// 1. list the settlement groups
 	const groupIds: string[] = [];
 	let gToken: string | null = null;
 	let gPages = 0;
@@ -391,7 +407,6 @@ async function collectEventsBySettlement(days: number) {
 		gPages++;
 	} while (gToken && gPages < 20);
 
-	// 2. pull each group's events
 	const groups: any[] = [];
 	let pages = 0;
 	let hitPageLimit = false;
@@ -414,7 +429,6 @@ async function collectEventsBySettlement(days: number) {
 				if (payload.FinancialEvents) groups.push(payload.FinancialEvents);
 				token = payload.NextToken || null;
 			} catch {
-				// One unreadable settlement must not kill the whole report.
 				token = null;
 			}
 			inner++;
@@ -436,10 +450,10 @@ async function collectEventsBySettlement(days: number) {
 function createServer() {
 	const server = new McpServer({
 		name: "AH Inside Seller Central",
-		version: "3.0.0",
+		version: "4.0.0",
 	});
 
-	/* ---------------- INVENTORY ---------------- */
+	/* ================= INVENTORY ================= */
 
 	server.registerTool(
 		"get_inventory",
@@ -463,9 +477,7 @@ function createServer() {
 				let truncated = false;
 
 				do {
-					const path = nextToken
-						? base + "&nextToken=" + encodeURIComponent(nextToken)
-						: base;
+					const path = nextToken ? base + "&nextToken=" + encodeURIComponent(nextToken) : base;
 					const data = await spGet(path);
 					const payload = data?.payload ?? data;
 					items.push(...(payload?.inventorySummaries || []));
@@ -521,7 +533,7 @@ function createServer() {
 		}
 	);
 
-	/* ---------------- FINANCIALS ---------------- */
+	/* ================= FINANCIALS ================= */
 
 	server.registerTool(
 		"get_financials",
@@ -529,10 +541,7 @@ function createServer() {
 			description:
 				"Complete financial picture for a period: revenue, referral and FBA fees, ADVERTISING SPEND, coupons, storage, subscription, refunds, removals and every other event type Amazon reports, with dates. Uses explicit per-event-type maths so totals are not double counted. Set by_settlement true for windows over 90 days. Default 30 days.",
 			inputSchema: z.object({
-				days: z
-					.number()
-					.optional()
-					.describe("Days to look back. Default 30. Maximum 720."),
+				days: z.number().optional().describe("Days to look back. Default 30. Maximum 720."),
 				by_settlement: z
 					.boolean()
 					.optional()
@@ -551,9 +560,7 @@ function createServer() {
 						requested_days: window,
 						max_days: MAX_FINANCE_DAYS,
 						message:
-							"Amazon's Finances API rejects a PostedAfter older than two years. Earlier versions of this tool reported that rejection as a real $0.00. Reduce the window to " +
-							MAX_FINANCE_DAYS +
-							" days or fewer.",
+							"Amazon's Finances API rejects a PostedAfter older than two years. Earlier versions reported that rejection as a real $0.00. Reduce the window.",
 					});
 				}
 
@@ -564,13 +571,7 @@ function createServer() {
 
 				const { groups, pages, hitPageLimit, settlementsRead } = collected;
 
-				/* --- every event list, counted with the correct maths --- */
-
-				const byList: Record<
-					string,
-					{ events: number; usd: number; approximate: boolean }
-				> = {};
-
+				const byList: Record<string, { events: number; usd: number; approximate: boolean }> = {};
 				let earliest: string | null = null;
 				let latest: string | null = null;
 
@@ -584,20 +585,15 @@ function createServer() {
 					for (const key of Object.keys(g)) {
 						const list = g[key];
 						if (!Array.isArray(list) || list.length === 0) continue;
-
 						const handler = EVENT_HANDLERS[key];
-						if (!byList[key])
-							byList[key] = { events: 0, usd: 0, approximate: !handler };
+						if (!byList[key]) byList[key] = { events: 0, usd: 0, approximate: !handler };
 						byList[key].events += list.length;
-
 						for (const ev of list) {
 							noteDate(dateOf(ev));
 							byList[key].usd += handler ? handler(ev) : sumAllAmountsUnsafe(ev);
 						}
 					}
 				}
-
-				/* --- shipment events broken down, per SKU, with dates --- */
 
 				let revenue = 0;
 				let itemFees = 0;
@@ -614,8 +610,8 @@ function createServer() {
 						promos: number;
 						refunds: number;
 						refund_units: number;
-						first_sale: string | null;
-						last_sale: string | null;
+						first_posted: string | null;
+						last_posted: string | null;
 					}
 				> = {};
 
@@ -628,8 +624,8 @@ function createServer() {
 							promos: 0,
 							refunds: 0,
 							refund_units: 0,
-							first_sale: null,
-							last_sale: null,
+							first_posted: null,
+							last_posted: null,
 						};
 					return perSku[sku];
 				};
@@ -645,8 +641,8 @@ function createServer() {
 							units += qty;
 
 							if (posted) {
-								if (!b.first_sale || posted < b.first_sale) b.first_sale = posted;
-								if (!b.last_sale || posted > b.last_sale) b.last_sale = posted;
+								if (!b.first_posted || posted < b.first_posted) b.first_posted = posted;
+								if (!b.last_posted || posted > b.last_posted) b.last_posted = posted;
 							}
 
 							for (const c of item.ItemChargeList || []) {
@@ -681,8 +677,6 @@ function createServer() {
 						}
 					}
 				}
-
-				/* --- named lines --- */
 
 				const line = (k: string) => byList[k]?.usd || 0;
 				const count = (k: string) => byList[k]?.events || 0;
@@ -728,15 +722,7 @@ function createServer() {
 					itemFees + promotions + advertising + serviceFees + coupons + deals + refunds;
 
 				const trueNet =
-					revenue +
-					totalCosts +
-					adjustments +
-					debtRecovery +
-					liquidations +
-					removals +
-					otherTotal;
-
-				/* --- per-SKU table --- */
+					revenue + totalCosts + adjustments + debtRecovery + liquidations + removals + otherTotal;
 
 				const skuRows = Object.entries(perSku)
 					.map(([sku, v]) => {
@@ -745,8 +731,11 @@ function createServer() {
 						const row: any = {
 							sku,
 							units: v.units,
-							first_sale: v.first_sale,
-							last_sale: v.last_sale,
+							// These are POSTED dates, not order dates. Amazon posts the
+							// money roughly two weeks after the sale. Use
+							// get_order_summary for the real sale date.
+							first_posted: v.first_posted,
+							last_posted: v.last_posted,
 							revenue_usd: money(v.revenue),
 							referral_and_fba_fees_usd: money(v.fees),
 							promotions_usd: money(v.promos),
@@ -765,23 +754,18 @@ function createServer() {
 					})
 					.sort((a, b) => Number(b.revenue_usd) - Number(a.revenue_usd));
 
-				/* --- warnings --- */
-
 				const warnings: string[] = [];
-
 				if (!useSettlements && window > 90) {
 					warnings.push(
-						"WINDOW OVER 90 DAYS WITHOUT by_settlement. Amazon does not guarantee that listFinancialEvents returns every event over a wide date range, and it returns no signal when it does not. A 430-day pull on this account returned FEWER events than a 365-day pull and dropped a whole SKU. Re-run with by_settlement: true before trusting any total here."
+						"WINDOW OVER 90 DAYS WITHOUT by_settlement. Amazon does not guarantee that listFinancialEvents returns every event over a wide date range and gives no signal when it does not. Compare latest_event against today: if it stops short, the data is incomplete. Re-run with by_settlement: true."
 					);
 				}
-				if (hitPageLimit) {
-					warnings.push("PAGE LIMIT HIT. Results are incomplete. Narrow the window.");
-				}
+				if (hitPageLimit) warnings.push("PAGE LIMIT HIT. Results incomplete. Narrow the window.");
 				if (approximateLists.length) {
 					warnings.push(
 						"APPROXIMATE EVENT TYPES: " +
 							approximateLists.join(", ") +
-							". These have no explicit handler in this file, so their totals come from a generic walk that cannot tell a total apart from its own components. Add a handler in EVENT_HANDLERS before relying on them."
+							". No explicit handler, so a generic walk was used which cannot tell a total from its own components. Add a handler in EVENT_HANDLERS before relying on them."
 					);
 				}
 
@@ -794,7 +778,6 @@ function createServer() {
 					truncated: hitPageLimit,
 					earliest_event: earliest,
 					latest_event: latest,
-
 					warnings: warnings.length ? warnings : undefined,
 
 					summary: {
@@ -834,19 +817,16 @@ function createServer() {
 					all_event_lists: Object.fromEntries(
 						Object.entries(byList).map(([k, v]) => [
 							prettify(k),
-							{
-								events: v.events,
-								usd: money(v.usd),
-								...(v.approximate ? { approximate: true } : {}),
-							},
+							{ events: v.events, usd: money(v.usd), ...(v.approximate ? { approximate: true } : {}) },
 						])
 					),
 
 					notes: [
-						"Advertising uses transactionValue only. v2 added baseValue + taxValue + transactionValue and roughly doubled it.",
-						"per_sku net EXCLUDES advertising and storage — those are account-level, not per-SKU. Only summary.net_usd is the real bottom line.",
-						"Landed cost is not available from Amazon. Contribution appears only for SKUs listed in the COGS constant at the top of this file.",
-						"Clicks, CPC, impressions and ACOS require the Amazon Ads API. This tool gives total spend only.",
+						"Dates here are POSTED dates, not order dates. Amazon posts money about two weeks after the sale. Use get_order_summary for real sale dates.",
+						"Advertising uses transactionValue only. v2 added baseValue + taxValue + transactionValue and doubled it.",
+						"per_sku net EXCLUDES advertising and storage — those are account-level. Only summary.net_usd is the bottom line.",
+						"Landed cost is not available from Amazon. Contribution appears only for SKUs in the COGS constant.",
+						"Clicks, CPC and ACOS require the Amazon Ads API. This is total spend only.",
 					],
 				});
 			} catch (e) {
@@ -855,7 +835,7 @@ function createServer() {
 		}
 	);
 
-	/* ---------------- ORDERS ---------------- */
+	/* ================= ORDERS ================= */
 
 	server.registerTool(
 		"get_order_summary",
@@ -917,13 +897,11 @@ function createServer() {
 					byStatus[o.OrderStatus] = (byStatus[o.OrderStatus] || 0) + 1;
 					const ch = o.FulfillmentChannel || "unknown";
 					byChannel[ch] = (byChannel[ch] || 0) + 1;
-
 					const total = amountOf(o.OrderTotal);
 					const qty =
 						Number(o.NumberOfItemsShipped || 0) + Number(o.NumberOfItemsUnshipped || 0);
 					gross += total;
 					units += qty;
-
 					const month = String(o.PurchaseDate || "").slice(0, 7) || "unknown";
 					if (!byMonth[month]) byMonth[month] = { orders: 0, units: 0, gross: 0 };
 					byMonth[month].orders += 1;
@@ -935,7 +913,7 @@ function createServer() {
 				const lastOrder = orders[0];
 				const lastShipped = shipped[0];
 
-				const daysSince = (iso: string | undefined) =>
+				const daysSince = (iso: string | undefined | null) =>
 					iso ? Math.floor((Date.now() - new Date(iso).getTime()) / 86400000) : null;
 
 				const out: any = {
@@ -966,20 +944,14 @@ function createServer() {
 						  }
 						: null,
 
-					oldest_order_in_window: orders.length
-						? orders[orders.length - 1].PurchaseDate
-						: null,
-
+					oldest_order_in_window: orders.length ? orders[orders.length - 1].PurchaseDate : null,
 					by_status: byStatus,
 					by_fulfillment_channel: byChannel,
 
 					by_month: Object.fromEntries(
 						Object.entries(byMonth)
 							.sort((a, b) => b[0].localeCompare(a[0]))
-							.map(([m, v]) => [
-								m,
-								{ orders: v.orders, units: v.units, gross_usd: money(v.gross) },
-							])
+							.map(([m, v]) => [m, { orders: v.orders, units: v.units, gross_usd: money(v.gross) }])
 					),
 
 					recent_orders: orders.slice(0, 20).map((o) => ({
@@ -1004,8 +976,7 @@ function createServer() {
 							const d = await spGet("/orders/v0/orders/" + o.AmazonOrderId + "/orderItems");
 							for (const it of d?.payload?.OrderItems || []) {
 								const sku = it.SellerSKU || "UNKNOWN";
-								if (!perSku[sku])
-									perSku[sku] = { units: 0, revenue: 0, orders: 0, last_sale: null };
+								if (!perSku[sku]) perSku[sku] = { units: 0, revenue: 0, orders: 0, last_sale: null };
 								perSku[sku].units += Number(it.QuantityOrdered || 0);
 								perSku[sku].revenue += amountOf(it.ItemPrice);
 								perSku[sku].orders += 1;
@@ -1015,7 +986,7 @@ function createServer() {
 								}
 							}
 						} catch {
-							// One bad order must not kill the whole report.
+							/* one bad order must not kill the report */
 						}
 					}
 
@@ -1026,7 +997,7 @@ function createServer() {
 							orders: v.orders,
 							revenue_usd: money(v.revenue),
 							last_sale: v.last_sale,
-							days_since_last_sale: daysSince(v.last_sale || undefined),
+							days_since_last_sale: daysSince(v.last_sale),
 						}))
 						.sort((a, b) => Number(b.revenue_usd) - Number(a.revenue_usd));
 
@@ -1037,7 +1008,7 @@ function createServer() {
 				}
 
 				out.note =
-					"units counts shipped plus unshipped items and therefore includes cancelled orders. Compare against by_status before quoting it.";
+					"units counts shipped plus unshipped and therefore includes cancelled orders. Compare against by_status before quoting it.";
 
 				return textResult(out);
 			} catch (e) {
@@ -1046,7 +1017,479 @@ function createServer() {
 		}
 	);
 
-	/* ---------------- LISTINGS ---------------- */
+	/* ================= SALES METRICS ================= */
+
+	server.registerTool(
+		"get_sales_metrics",
+		{
+			description:
+				"Units ordered and revenue by day, week or month, straight from Amazon's Sales API. Faster than get_order_summary for trend shape and does not need per-order calls.",
+			inputSchema: z.object({
+				days: z.number().optional().describe("Days to look back. Default 30."),
+				granularity: z
+					.string()
+					.optional()
+					.describe("Day, Week, Month, Year or Total. Default Day."),
+			}),
+		},
+		async ({ days, granularity }: any) => {
+			try {
+				const window = Math.max(1, days ?? 30);
+				const gran = granularity || "Day";
+				const start = daysAgoISO(window);
+				const end = new Date(Date.now() - 120000).toISOString();
+
+				const data = await spGet(
+					"/sales/v1/orderMetrics?marketplaceIds=" +
+						MARKETPLACE_ID +
+						"&interval=" +
+						encodeURIComponent(start + "--" + end) +
+						"&granularity=" +
+						gran +
+						"&granularityTimeZone=UTC"
+				);
+
+				const rows = (data?.payload || []).map((p: any) => ({
+					interval: p.interval,
+					units_ordered: p.unitCount,
+					order_items: p.orderItemCount,
+					orders: p.orderCount,
+					revenue: money(amountOf(p.totalSales)),
+					currency: currencyOf(p.totalSales) || "USD",
+					average_unit_price: money(amountOf(p.averageUnitPrice)),
+				}));
+
+				const nonZero = rows.filter((r: any) => Number(r.units_ordered) > 0);
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					period_days: window,
+					granularity: gran,
+					intervals_returned: rows.length,
+					intervals_with_sales: nonZero.length,
+					total_units: rows.reduce((t: number, r: any) => t + Number(r.units_ordered || 0), 0),
+					total_revenue: money(rows.reduce((t: number, r: any) => t + Number(r.revenue || 0), 0)),
+					periods_with_sales: nonZero,
+					note:
+						"Only intervals with at least one unit are listed under periods_with_sales. Zero-sale days are counted but not printed.",
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= TRAFFIC AND CONVERSION ================= */
+
+	server.registerTool(
+		"get_traffic_and_conversion",
+		{
+			description:
+				"THE MISSING NUMBER. Sessions, page views, Buy Box percentage and UNIT SESSION PERCENTAGE — your real conversion rate — per ASIN and per day, from Amazon's Sales and Traffic business report. Every plan that assumed 5% or 8.3% conversion can finally be checked against fact. Amazon builds this report asynchronously; if it is not ready inside the wait, a report_id comes back for get_report.",
+			inputSchema: z.object({
+				days: z.number().optional().describe("Days to look back. Default 30. Maximum 730."),
+				wait_seconds: z
+					.number()
+					.optional()
+					.describe("How long to wait for Amazon to build it. Default 55."),
+			}),
+		},
+		async ({ days, wait_seconds }: any) => {
+			try {
+				const window = Math.max(1, Math.min(days ?? 30, 730));
+				const wait = Math.max(5, Math.min(wait_seconds ?? 55, 110));
+
+				const { reportId, status, documentId } = await createAndWait(
+					"GET_SALES_AND_TRAFFIC_REPORT",
+					window,
+					{ dateGranularity: "DAY", asinGranularity: "CHILD" },
+					wait
+				);
+
+				if (status !== "DONE" || !documentId) {
+					return textResult({
+						report_id: reportId,
+						status,
+						message:
+							"Amazon is still building this report. Call get_report with this report_id in a minute or two. Nothing is lost — the report keeps generating on Amazon's side.",
+					});
+				}
+
+				const raw = await downloadReportDocument(documentId);
+				const json = JSON.parse(raw);
+
+				const byAsin = (json.salesAndTrafficByAsin || []).map((r: any) => {
+					const t = r.trafficByAsin || {};
+					const s = r.salesByAsin || {};
+					return {
+						date: r.startDate,
+						asin: r.parentAsin || r.childAsin,
+						child_asin: r.childAsin,
+						sessions: t.sessions ?? 0,
+						page_views: t.pageViews ?? 0,
+						buy_box_pct: t.buyBoxPercentage ?? 0,
+						units_ordered: s.unitsOrdered ?? 0,
+						ordered_revenue: amountOf(s.orderedProductSales),
+						// This is the conversion rate.
+						unit_session_pct: t.unitSessionPercentage ?? 0,
+					};
+				});
+
+				// Roll up per ASIN so the real CVR is a single number, not 30 rows.
+				const roll: Record<string, { sessions: number; units: number; revenue: number; views: number }> = {};
+				for (const r of byAsin) {
+					const key = r.child_asin || r.asin || "UNKNOWN";
+					if (!roll[key]) roll[key] = { sessions: 0, units: 0, revenue: 0, views: 0 };
+					roll[key].sessions += Number(r.sessions || 0);
+					roll[key].views += Number(r.page_views || 0);
+					roll[key].units += Number(r.units_ordered || 0);
+					roll[key].revenue += Number(r.ordered_revenue || 0);
+				}
+
+				const perAsin = Object.entries(roll)
+					.map(([asin, v]) => ({
+						asin,
+						sessions: v.sessions,
+						page_views: v.views,
+						units_ordered: v.units,
+						revenue_usd: money(v.revenue),
+						conversion_rate_pct: v.sessions ? ((v.units / v.sessions) * 100).toFixed(2) : "0.00",
+					}))
+					.sort((a, b) => b.sessions - a.sessions);
+
+				const totalSessions = perAsin.reduce((t, r) => t + r.sessions, 0);
+				const totalUnits = perAsin.reduce((t, r) => t + r.units_ordered, 0);
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					period_days: window,
+					report_id: reportId,
+					rows_returned: byAsin.length,
+
+					account_totals: {
+						sessions: totalSessions,
+						units_ordered: totalUnits,
+						conversion_rate_pct: totalSessions
+							? ((totalUnits / totalSessions) * 100).toFixed(2)
+							: "0.00",
+					},
+
+					per_asin: perAsin,
+					daily_rows: byAsin.slice(0, 200),
+
+					notes: [
+						"conversion_rate_pct is units ordered divided by sessions. This is the number every launch plan has been assuming rather than measuring.",
+						"Buy Box percentage below 100 on a listing with no competitors usually means the listing was suppressed or out of stock for part of the day.",
+						"Zero sessions with live inventory means nobody is finding the listing — that is a ranking problem, not a conversion problem.",
+					],
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= GENERIC REPORTS ================= */
+
+	server.registerTool(
+		"run_report",
+		{
+			description:
+				"Request any Amazon report and return it. Useful types: GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (why customers returned items — this is how to explain a high refund rate), GET_FBA_REIMBURSEMENTS_DATA (money Amazon owes for lost or damaged stock), GET_LEDGER_SUMMARY_VIEW_DATA (inventory movement), GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA (per-SKU fee estimates), GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT (real keyword impressions, clicks and purchases — Brand Registry only), GET_MERCHANT_LISTINGS_ALL_DATA. Returns a report_id if Amazon needs longer.",
+			inputSchema: z.object({
+				report_type: z.string().describe("The Amazon report type, exactly as spelled above."),
+				days: z.number().optional().describe("Days to look back. Default 30."),
+				wait_seconds: z.number().optional().describe("How long to wait. Default 55."),
+				max_rows: z.number().optional().describe("Rows to return. Default 200."),
+			}),
+		},
+		async ({ report_type, days, wait_seconds, max_rows }: any) => {
+			try {
+				const window = Math.max(1, days ?? 30);
+				const wait = Math.max(5, Math.min(wait_seconds ?? 55, 110));
+				const limit = Math.max(1, Math.min(max_rows ?? 200, 1000));
+
+				const { reportId, status, documentId } = await createAndWait(
+					report_type,
+					window,
+					undefined,
+					wait
+				);
+
+				if (status !== "DONE" || !documentId) {
+					return textResult({
+						report_id: reportId,
+						report_type,
+						status,
+						message:
+							"Still building. Call get_report with this report_id shortly. FATAL usually means this account is not eligible for that report — Search Query Performance for example needs Brand Registry.",
+					});
+				}
+
+				const raw = await downloadReportDocument(documentId);
+				const trimmed = raw.trim();
+
+				if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+					return textResult({
+						pulled_at: new Date().toISOString(),
+						report_type,
+						report_id: reportId,
+						format: "json",
+						data: JSON.parse(trimmed),
+					});
+				}
+
+				const rows = parseTSV(raw, limit);
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					report_type,
+					report_id: reportId,
+					format: "tsv",
+					total_lines: raw.split("\n").filter((l) => l.trim()).length - 1,
+					rows_returned: rows.length,
+					columns: rows.length ? Object.keys(rows[0]) : [],
+					rows,
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"get_report",
+		{
+			description:
+				"Fetch a report that was requested earlier, using the report_id returned by run_report or get_traffic_and_conversion.",
+			inputSchema: z.object({
+				report_id: z.string().describe("The report_id from an earlier call."),
+				max_rows: z.number().optional().describe("Rows to return. Default 200."),
+			}),
+		},
+		async ({ report_id, max_rows }: any) => {
+			try {
+				const limit = Math.max(1, Math.min(max_rows ?? 200, 1000));
+				const info = await spGet("/reports/2021-06-30/reports/" + encodeURIComponent(report_id));
+
+				if (info.processingStatus !== "DONE") {
+					return textResult({
+						report_id,
+						status: info.processingStatus,
+						report_type: info.reportType,
+						message:
+							info.processingStatus === "FATAL"
+								? "Amazon could not build this report. Usually an eligibility problem — Search Query Performance needs Brand Registry, and some reports need a longer date range."
+								: "Not ready yet. Try again in a minute.",
+					});
+				}
+
+				const raw = await downloadReportDocument(info.reportDocumentId);
+				const trimmed = raw.trim();
+
+				if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+					return textResult({
+						pulled_at: new Date().toISOString(),
+						report_id,
+						report_type: info.reportType,
+						format: "json",
+						data: JSON.parse(trimmed),
+					});
+				}
+
+				const rows = parseTSV(raw, limit);
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					report_id,
+					report_type: info.reportType,
+					format: "tsv",
+					total_lines: raw.split("\n").filter((l) => l.trim()).length - 1,
+					rows_returned: rows.length,
+					columns: rows.length ? Object.keys(rows[0]) : [],
+					rows,
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= PRICING ================= */
+
+	server.registerTool(
+		"get_competitive_pricing",
+		{
+			description:
+				"Buy Box owner, lowest offer, offer count and condition breakdown for one or more ASINs. Works on competitor ASINs too, so it can check what a rival is charging today without opening Amazon.",
+			inputSchema: z.object({
+				asins: z.string().describe("One ASIN, or several separated by commas. Maximum 20."),
+			}),
+		},
+		async ({ asins }: any) => {
+			try {
+				const list = String(asins)
+					.split(",")
+					.map((a) => a.trim())
+					.filter(Boolean)
+					.slice(0, 20);
+
+				const data = await spGet(
+					"/products/pricing/v0/competitivePrice?MarketplaceId=" +
+						MARKETPLACE_ID +
+						"&Asins=" +
+						encodeURIComponent(list.join(",")) +
+						"&ItemType=Asin"
+				);
+
+				const rows = (data?.payload || []).map((p: any) => {
+					const product = p.Product || {};
+					const comp = product.CompetitivePricing || {};
+					const prices = (comp.CompetitivePrices || []).map((c: any) => ({
+						condition: c.condition,
+						belongs_to_requester: c.belongsToRequester,
+						landed_price: money(amountOf(c.Price?.LandedPrice)),
+						listing_price: money(amountOf(c.Price?.ListingPrice)),
+						shipping: money(amountOf(c.Price?.Shipping)),
+					}));
+					const counts = (comp.NumberOfOfferListings || []).map((n: any) => ({
+						condition: n.condition,
+						count: n.Count,
+					}));
+					return {
+						asin: p.ASIN,
+						status: p.status,
+						competitive_prices: prices,
+						offer_counts: counts,
+						sales_rankings: (product.SalesRankings || []).slice(0, 3),
+					};
+				});
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					asins_requested: list,
+					results: rows,
+					note:
+						"belongs_to_requester true means that price is your own offer. A missing Buy Box price usually means no offer currently holds it.",
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= FEE ESTIMATE ================= */
+
+	server.registerTool(
+		"estimate_fees",
+		{
+			description:
+				"Referral and FBA fees for any ASIN at any price, before you ever list it. This is the Gate 2 check without guessing: run it on a comparable copper bottle ASIN at 49.95 to see the real fee, and re-run it whenever the kit box dimensions change.",
+			inputSchema: z.object({
+				asin: z.string().describe("The ASIN to price against — a competitor's is fine."),
+				price: z.number().describe("Selling price in USD, for example 49.95."),
+				shipping: z.number().optional().describe("Shipping charged to the buyer. Default 0."),
+				fba: z.boolean().optional().describe("Fulfilled by Amazon. Default true."),
+			}),
+		},
+		async ({ asin, price, shipping, fba }: any) => {
+			try {
+				const body = {
+					FeesEstimateRequest: {
+						MarketplaceId: MARKETPLACE_ID,
+						IsAmazonFulfilled: fba !== false,
+						PriceToEstimateFees: {
+							ListingPrice: { CurrencyCode: "USD", Amount: price },
+							Shipping: { CurrencyCode: "USD", Amount: shipping ?? 0 },
+						},
+						Identifier: "ah-" + Date.now(),
+					},
+				};
+
+				const data = await spPost(
+					"/products/fees/v0/items/" + encodeURIComponent(asin) + "/feesEstimate",
+					body
+				);
+
+				const result = data?.payload?.FeesEstimateResult || data?.FeesEstimateResult || {};
+				const est = result.FeesEstimate || {};
+				const details = (est.FeeDetailList || []).map((f: any) => ({
+					type: f.FeeType,
+					amount_usd: money(amountOf(f.FeeAmount)),
+					promotion_usd: money(amountOf(f.FeePromotion)),
+					final_usd: money(amountOf(f.FinalFee)),
+				}));
+
+				const totalFees = amountOf(est.TotalFeesEstimate);
+				const net = price + (shipping ?? 0) - totalFees;
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					asin,
+					price_usd: money(price),
+					status: result.Status,
+					error: result.Error?.Message,
+					total_fees_usd: money(totalFees),
+					fee_percentage: price ? ((totalFees / price) * 100).toFixed(1) + "%" : "0.0%",
+					net_before_cogs_usd: money(net),
+					fee_breakdown: details,
+					note:
+						"Gate 2 wants fees under roughly 12-15% of price. This figure uses the dimensions of the ASIN you passed, so run it against a bottle of the same size as the finished kit box, not the bare bottle.",
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= INBOUND SHIPMENTS ================= */
+
+	server.registerTool(
+		"get_inbound_shipments",
+		{
+			description:
+				"FBA inbound shipments and their status — what is on the way to Amazon, what has been received, and what is stuck. Use this to track the 50 copper bottles once they ship.",
+			inputSchema: z.object({
+				days: z.number().optional().describe("Days to look back. Default 180."),
+			}),
+		},
+		async ({ days }: any) => {
+			try {
+				const window = Math.max(1, days ?? 180);
+				const data = await spGet(
+					"/fba/inbound/v0/shipments?QueryType=DATE_RANGE&MarketplaceId=" +
+						MARKETPLACE_ID +
+						"&LastUpdatedAfter=" +
+						encodeURIComponent(daysAgoISO(window))
+				);
+
+				const shipments = (data?.payload?.ShipmentData || []).map((s: any) => ({
+					shipment_id: s.ShipmentId,
+					name: s.ShipmentName,
+					status: s.ShipmentStatus,
+					destination: s.DestinationFulfillmentCenterId,
+					units_shipped: s.BoxContentsSource,
+					are_cases_required: s.AreCasesRequired,
+					label_prep: s.LabelPrepType,
+				}));
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					period_days: window,
+					shipment_count: shipments.length,
+					by_status: shipments.reduce((t: any, s: any) => {
+						t[s.status] = (t[s.status] || 0) + 1;
+						return t;
+					}, {}),
+					shipments,
+					note:
+						"WORKING means created but not sent. SHIPPED means in transit. RECEIVING means Amazon is checking it in. CLOSED means done. Anything sitting in RECEIVING for over a week needs a case opened.",
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= LISTINGS ================= */
 
 	server.registerTool(
 		"list_skus",
@@ -1069,9 +1512,7 @@ function createServer() {
 				let pages = 0;
 
 				do {
-					const path = nextToken
-						? base + "&pageToken=" + encodeURIComponent(nextToken)
-						: base;
+					const path = nextToken ? base + "&pageToken=" + encodeURIComponent(nextToken) : base;
 					const data = await spGet(path);
 					items.push(...(data?.items || []));
 					nextToken = data?.pagination?.nextToken || null;
@@ -1096,9 +1537,7 @@ function createServer() {
 						created: s.createdDate,
 						last_updated: s.lastUpdatedDate,
 						issue_count: issues.length,
-						issues: issues
-							.map((x: any) => x.code + " (" + x.severity + "): " + x.message)
-							.slice(0, 5),
+						issues: issues.map((x: any) => x.code + " (" + x.severity + "): " + x.message).slice(0, 5),
 						enforcements,
 					};
 				});
@@ -1110,7 +1549,7 @@ function createServer() {
 					suppressed_count: rows.filter((r) => r.suppressed).length,
 					skus: rows,
 					note:
-						"DISCOVERABLE without BUYABLE means the detail page exists but nothing can be bought. That is normal at zero inventory and also what a suppressed listing looks like — check the suppressed flag to tell them apart.",
+						"DISCOVERABLE without BUYABLE means the detail page exists but nothing can be bought. Normal at zero inventory, and also what a suppressed listing looks like — check the suppressed flag to tell them apart.",
 				});
 			} catch (e) {
 				return errorResult(e);
@@ -1139,7 +1578,6 @@ function createServer() {
 						"&includedData=summaries,attributes,issues,offers,fulfillmentAvailability,procurement"
 				);
 
-				// Surface the things that are easy to miss inside a large attribute blob.
 				const s = (data?.summaries || [])[0] || {};
 				const po = (data?.attributes?.purchasable_offer || [])[0] || {};
 				const flags = {
@@ -1147,9 +1585,7 @@ function createServer() {
 					buyable: (s.status || []).includes("BUYABLE"),
 					offer_starts: po?.start_at?.value ?? null,
 					offer_ends: po?.end_at?.value ?? null,
-					offer_ended: po?.end_at?.value
-						? new Date(po.end_at.value).getTime() < Date.now()
-						: false,
+					offer_ended: po?.end_at?.value ? new Date(po.end_at.value).getTime() < Date.now() : false,
 					parentage: data?.attributes?.parentage_level?.[0]?.value ?? null,
 					suppressed: (data?.issues || []).some((x: any) =>
 						(x.enforcements?.actions || []).some((a: any) => a.action === "LISTING_SUPPRESSED")
@@ -1163,7 +1599,7 @@ function createServer() {
 		}
 	);
 
-	/* ---------------- SETTLEMENTS ---------------- */
+	/* ================= SETTLEMENTS ================= */
 
 	server.registerTool(
 		"get_settlements",
@@ -1177,7 +1613,6 @@ function createServer() {
 		async ({ days }: any) => {
 			try {
 				const window = Math.max(1, days ?? 90);
-
 				const raw: any[] = [];
 				let nextToken: string | null = null;
 				let pages = 0;
@@ -1208,8 +1643,6 @@ function createServer() {
 					fund_transfer_status: g.FundTransferStatus,
 					original_total: money(amountOf(g.OriginalTotal)),
 					original_currency: currencyOf(g.OriginalTotal) || "USD",
-					// v2 called this converted_total_usd. It is NOT USD — it is the
-					// disbursement currency, GBP on this account at roughly 0.728.
 					converted_total: money(amountOf(g.ConvertedTotal)),
 					disbursement_currency: currencyOf(g.ConvertedTotal) || "unknown",
 					beginning_balance: money(amountOf(g.BeginningBalance)),
@@ -1223,11 +1656,13 @@ function createServer() {
 				const failed = groups.filter((g) => g.fund_transfer_status === "Failed");
 				const succeeded = groups.filter((g) => g.fund_transfer_status === "Succeeded");
 
-				// Money that is sitting in a period whose transfer failed.
 				const stuck: Record<string, number> = {};
 				for (const g of failed) {
 					const bal = Number(g.beginning_balance);
-					if (bal > 0) stuck[g.beginning_balance] = (stuck[g.beginning_balance] || 0) + 1;
+					if (bal > 0) {
+						const key = g.beginning_balance + " " + g.beginning_balance_currency;
+						stuck[key] = (stuck[key] || 0) + 1;
+					}
 				}
 
 				const openGroups = groups.filter((g) => g.status === "Open");
@@ -1253,8 +1688,7 @@ function createServer() {
 						last_successful_transfer: succeeded[0]
 							? {
 									date: succeeded[0].fund_transfer_date,
-									amount:
-										succeeded[0].converted_total + " " + succeeded[0].disbursement_currency,
+									amount: succeeded[0].converted_total + " " + succeeded[0].disbursement_currency,
 							  }
 							: null,
 					},
@@ -1262,7 +1696,7 @@ function createServer() {
 					settlements: groups,
 
 					note:
-						"A balance that repeats unchanged across many Failed periods is a deposit-method fault, not a rounding issue. Seller Central → Payments → Deposit Methods. converted_total is the disbursement currency, not USD.",
+						"Check the CURRENCY on a stuck balance before assuming a bank fault. A balance in a currency you do not sell in belongs to a marketplace with no deposit method attached, which Amazon will retry forever. Seller Central → Payments → Deposit Methods.",
 				});
 			} catch (e) {
 				return errorResult(e);
@@ -1282,8 +1716,6 @@ export default {
 		const url = new URL(request.url);
 		const gate = env.ACCESS_KEY;
 
-		// The access key must be the first path segment, so the bare
-		// workers.dev URL on its own returns nothing.
 		if (!gate || !url.pathname.startsWith("/" + gate)) {
 			return new Response("Not found", { status: 404 });
 		}
