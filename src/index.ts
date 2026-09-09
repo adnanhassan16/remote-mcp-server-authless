@@ -472,7 +472,7 @@ async function collectEventsBySettlement(days: number) {
 function createServer() {
 	const server = new McpServer({
 		name: "AH Inside Seller Central",
-		version: "4.1.0",
+		version: "4.2.0",
 	});
 
 	/* ================= INVENTORY ================= */
@@ -1836,6 +1836,200 @@ function createServer() {
 				});
 			} catch (e) {
 				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= AMAZON TEST (new in v4.2) ================= */
+
+	server.registerTool(
+		"amazon_test",
+		{
+			description:
+				"Stage 2 test. Opens a raw socket to the DataImpulse proxy, sends HTTP CONNECT for www.amazon.com:443, upgrades the socket with startTls, and requests a real Amazon search page over HTTPS. Reports the exit country, the HTTP status, whether a captcha was served, and how many product tiles were found. This is the test that decides whether the whole scraper approach works.",
+			inputSchema: z.object({
+				keyword: z
+					.string()
+					.optional()
+					.describe("Search phrase. Default 'copper water bottle'."),
+			}),
+		},
+		async ({ keyword }: any) => {
+			const started = Date.now();
+			try {
+				if (!currentEnv.PROXY_USER || !currentEnv.PROXY_PASS) {
+					return textResult({
+						error: "MISSING_SECRETS",
+						message: "PROXY_USER and PROXY_PASS are not set in Cloudflare.",
+					});
+				}
+
+				const term = (keyword || "copper water bottle").trim();
+				const path = "/s?k=" + encodeURIComponent(term);
+				const auth = btoa(currentEnv.PROXY_USER + ":" + currentEnv.PROXY_PASS);
+
+				// Step 1 — plain socket to the proxy, prepared for a later TLS upgrade.
+				const socket = connect(
+					{ hostname: "gw.dataimpulse.com", port: 823 },
+					{ secureTransport: "starttls", allowHalfOpen: false }
+				);
+
+				const enc = new TextEncoder();
+				const dec = new TextDecoder();
+
+				let writer = socket.writable.getWriter();
+				let reader = socket.readable.getReader();
+
+				// Step 2 — ask the proxy to tunnel to Amazon on 443.
+				const connectRequest =
+					"CONNECT www.amazon.com:443 HTTP/1.1\r\n" +
+					"Host: www.amazon.com:443\r\n" +
+					"Proxy-Authorization: Basic " +
+					auth +
+					"\r\n" +
+					"Proxy-Connection: Keep-Alive\r\n" +
+					"\r\n";
+
+				await writer.write(enc.encode(connectRequest));
+
+				let head = "";
+				while (!head.includes("\r\n\r\n")) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					if (value) head += dec.decode(value, { stream: true });
+					if (head.length > 8000) break;
+				}
+
+				const connectStatus = (head.split("\r\n")[0] || "").trim();
+
+				if (!/^HTTP\/1\.[01] 200/.test(connectStatus)) {
+					try {
+						reader.releaseLock();
+						writer.releaseLock();
+						await socket.close();
+					} catch {
+						/* ignore */
+					}
+					return textResult({
+						result: "CONNECT_REFUSED",
+						stage: "proxy CONNECT",
+						elapsed_ms: Date.now() - started,
+						connect_status: connectStatus || "(nothing returned)",
+						raw_head: head.slice(0, 400),
+						message:
+							"The proxy would not open a tunnel to port 443. A 407 here means credentials; anything else is a proxy-side refusal.",
+					});
+				}
+
+				// Step 3 — upgrade the same socket to TLS.
+				reader.releaseLock();
+				writer.releaseLock();
+
+				const tls = socket.startTls();
+				writer = tls.writable.getWriter();
+				reader = tls.readable.getReader();
+
+				// Step 4 — a normal browser request, inside the tunnel.
+				const request =
+					"GET " +
+					path +
+					" HTTP/1.1\r\n" +
+					"Host: www.amazon.com\r\n" +
+					"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
+					"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n" +
+					"Accept-Language: en-US,en;q=0.9\r\n" +
+					"Accept-Encoding: identity\r\n" +
+					"Upgrade-Insecure-Requests: 1\r\n" +
+					"Connection: close\r\n" +
+					"\r\n";
+
+				await writer.write(enc.encode(request));
+
+				let raw = "";
+				let bytes = 0;
+				const CAP = 90000;
+
+				while (bytes < CAP) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					if (value) {
+						bytes += value.length;
+						raw += dec.decode(value, { stream: true });
+					}
+				}
+				raw += dec.decode();
+
+				try {
+					reader.releaseLock();
+					await tls.close();
+				} catch {
+					/* the far side normally closes first */
+				}
+
+				if (!raw) {
+					return textResult({
+						result: "EMPTY_AFTER_TLS",
+						stage: "startTls",
+						elapsed_ms: Date.now() - started,
+						connect_status: connectStatus,
+						message:
+							"The tunnel opened but the TLS socket returned nothing. This is the known Cloudflare startTls production failure. Fall back to Browser Run.",
+					});
+				}
+
+				const split = raw.indexOf("\r\n\r\n");
+				const headers = split >= 0 ? raw.slice(0, split) : raw;
+				const body = split >= 0 ? raw.slice(split + 4) : "";
+				const statusLine = (headers.split("\r\n")[0] || "").trim();
+
+				const lower = body.toLowerCase();
+				const captcha =
+					lower.includes("api-services-support@amazon.com") ||
+					lower.includes("enter the characters you see below") ||
+					lower.includes("/errors/validatecaptcha") ||
+					lower.includes("robot check");
+
+				const asinMatches = body.match(/data-asin="[A-Z0-9]{10}"/g) || [];
+				const uniqueAsins = Array.from(
+					new Set(asinMatches.map((m) => m.slice(11, 21)))
+				);
+
+				const titleMatch = headers.match(/^HTTP\/1\.[01] (\d{3})/);
+				const httpCode = titleMatch ? Number(titleMatch[1]) : 0;
+
+				let verdict = "UNKNOWN";
+				if (captcha) verdict = "CAPTCHA_SERVED";
+				else if (httpCode === 200 && uniqueAsins.length >= 5) verdict = "SCRAPE_WORKING";
+				else if (httpCode === 200) verdict = "PAGE_RETURNED_BUT_NO_PRODUCTS";
+				else if (httpCode === 503) verdict = "AMAZON_THROTTLED";
+				else if (httpCode >= 300 && httpCode < 400) verdict = "REDIRECTED";
+
+				return textResult({
+					result: verdict,
+					elapsed_ms: Date.now() - started,
+					keyword: term,
+					connect_status: connectStatus,
+					http_status: statusLine,
+					bytes_received: bytes,
+					captcha_detected: captcha,
+					unique_asins_found: uniqueAsins.length,
+					first_asins: uniqueAsins.slice(0, 10),
+					body_preview: body.slice(0, 600),
+					next_step:
+						verdict === "SCRAPE_WORKING"
+							? "Everything works. Build search_amazon and get_product on this exact pattern."
+							: verdict === "CAPTCHA_SERVED"
+							? "Amazon served a captcha, most likely a datacentre exit IP. Retry a few times; if it persists, add a sticky-session or ISP filter to PROXY_USER."
+							: "Read http_status and body_preview before changing anything.",
+				});
+			} catch (e: any) {
+				return textResult({
+					result: "EXCEPTION",
+					elapsed_ms: Date.now() - started,
+					message: e?.message || String(e),
+					note:
+						"An exception at the startTls step is the documented Workers limitation. Anything else is ordinary and fixable.",
+				});
 			}
 		}
 	);
