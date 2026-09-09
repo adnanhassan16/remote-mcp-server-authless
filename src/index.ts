@@ -1,3 +1,4 @@
+import { connect } from "cloudflare:sockets";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
@@ -7,6 +8,27 @@ const MARKETPLACE_ID = "ATVPDKIKX0DER";
 const SELLER_ID = "A2ZPQEA709W727";
 
 /* ==================================================================
+   v4.1 — 9 September 2026
+
+   v4.0 unchanged in every respect. One tool added:
+
+     proxy_test   Stage 1 test of the DataImpulse residential proxy
+                  over a raw TCP socket. Cloudflare Workers' fetch()
+                  has no proxy option, so the only in-Worker route to
+                  a proxy is cloudflare:sockets connect(). This tool
+                  proves whether that route works at all, using plain
+                  HTTP to ip-api.com so no TLS can confuse the result.
+
+                  A US residential IP in the response = proxy works.
+                  An auth error = wrong PROXY_USER / PROXY_PASS.
+                  An empty response = raw sockets blocked; fall back
+                  to Cloudflare Browser Run.
+
+   Secrets required in Cloudflare for this tool:
+     PROXY_USER   DataImpulse login
+     PROXY_PASS   DataImpulse password
+
+   ------------------------------------------------------------------
    v4.0 — 5 September 2026
 
    v3 fixed the maths. v4 fills the gaps.
@@ -450,7 +472,7 @@ async function collectEventsBySettlement(days: number) {
 function createServer() {
 	const server = new McpServer({
 		name: "AH Inside Seller Central",
-		version: "4.0.0",
+		version: "4.1.0",
 	});
 
 	/* ================= INVENTORY ================= */
@@ -1697,6 +1719,120 @@ function createServer() {
 
 					note:
 						"Check the CURRENCY on a stuck balance before assuming a bank fault. A balance in a currency you do not sell in belongs to a marketplace with no deposit method attached, which Amazon will retry forever. Seller Central → Payments → Deposit Methods.",
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= PROXY TEST (new in v4.1) ================= */
+
+	server.registerTool(
+		"proxy_test",
+		{
+			description:
+				"Stage 1 test of the DataImpulse residential proxy. Fetches ip-api.com over a raw TCP socket through gw.dataimpulse.com:823 using plain HTTP, so no TLS can confuse the result. A US residential IP means the proxy route works. An empty response means raw sockets are blocked and Cloudflare Browser Run is the fallback. Requires the PROXY_USER and PROXY_PASS secrets.",
+			inputSchema: z.object({}),
+		},
+		async () => {
+			try {
+				if (!currentEnv.PROXY_USER || !currentEnv.PROXY_PASS) {
+					return textResult({
+						error: "MISSING_SECRETS",
+						message:
+							"PROXY_USER and PROXY_PASS are not set. Cloudflare dashboard → Workers & Pages → remote-mcp-server-authless → Settings → Variables and Secrets → Add, type Secret.",
+					});
+				}
+
+				const started = Date.now();
+				const auth = btoa(currentEnv.PROXY_USER + ":" + currentEnv.PROXY_PASS);
+
+				const socket = connect({ hostname: "gw.dataimpulse.com", port: 823 });
+
+				const request =
+					"GET http://ip-api.com/json HTTP/1.1\r\n" +
+					"Host: ip-api.com\r\n" +
+					"Proxy-Authorization: Basic " +
+					auth +
+					"\r\n" +
+					"User-Agent: Mozilla/5.0\r\n" +
+					"Accept: */*\r\n" +
+					"Connection: close\r\n" +
+					"\r\n";
+
+				const writer = socket.writable.getWriter();
+				await writer.write(new TextEncoder().encode(request));
+				writer.releaseLock();
+
+				const reader = socket.readable.getReader();
+				const chunks: Uint8Array[] = [];
+				let bytes = 0;
+
+				while (bytes < 20000) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					if (value) {
+						chunks.push(value);
+						bytes += value.length;
+					}
+				}
+
+				reader.releaseLock();
+				try {
+					await socket.close();
+				} catch {
+					/* the proxy usually closes first; that is not an error */
+				}
+
+				const decoder = new TextDecoder();
+				let raw = "";
+				for (const c of chunks) raw += decoder.decode(c, { stream: true });
+				raw += decoder.decode();
+
+				if (!raw) {
+					return textResult({
+						result: "EMPTY_RESPONSE",
+						elapsed_ms: Date.now() - started,
+						message:
+							"The socket opened but returned nothing. This is the known Workers startTls / raw-socket failure. Fall back to Cloudflare Browser Run.",
+					});
+				}
+
+				const split = raw.indexOf("\r\n\r\n");
+				const headers = split >= 0 ? raw.slice(0, split) : raw;
+				const body = split >= 0 ? raw.slice(split + 4) : "";
+				const statusLine = headers.split("\r\n")[0] || "";
+
+				let exitIp: string | null = null;
+				let country: string | null = null;
+				let isp: string | null = null;
+
+				const jsonStart = body.indexOf("{");
+				const jsonEnd = body.lastIndexOf("}");
+				if (jsonStart >= 0 && jsonEnd > jsonStart) {
+					try {
+						const parsed = JSON.parse(body.slice(jsonStart, jsonEnd + 1));
+						exitIp = parsed.query ?? null;
+						country = parsed.country ?? null;
+						isp = parsed.isp ?? null;
+					} catch {
+						/* chunked encoding can break a clean parse; raw_body still shows it */
+					}
+				}
+
+				return textResult({
+					result: exitIp ? "PROXY_WORKING" : "RESPONSE_RECEIVED_BUT_NOT_PARSED",
+					elapsed_ms: Date.now() - started,
+					status_line: statusLine,
+					exit_ip: exitIp,
+					country,
+					isp,
+					bytes_received: bytes,
+					raw_body: body.slice(0, 1200),
+					next_step: exitIp
+						? "Proxy route confirmed. Stage 2 is CONNECT + startTls to amazon.com."
+						: "Read status_line. A 407 means the login or password is wrong. Anything else, read raw_body.",
 				});
 			} catch (e) {
 				return errorResult(e);
