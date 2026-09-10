@@ -7,47 +7,59 @@ const MARKETPLACE_ID = "ATVPDKIKX0DER";
 const SELLER_ID = "A2ZPQEA709W727";
 
 /* ==================================================================
-   v4.0 — 5 September 2026
+   v5.0 — 10 September 2026
 
-   v3 fixed the maths. v4 fills the gaps.
+   v4 gave the account its own numbers. v5 gives it the MARKET's.
 
-   NEW IN v4 — six tools, all inside the six roles already approved:
+   WHY v5 EXISTS
+   Three screening rounds — 4,116 products, 46 full CPC tests — found
+   zero survivors. Every one died on a number that a third-party tool
+   had estimated wrongly: a price that was not the real page median, a
+   review wall that Black Box could not see, a "season" field that
+   measured listing growth. Amazon publishes the correct versions of
+   all three in Brand Analytics, free, and v4 could not reach them.
 
-     get_traffic_and_conversion  Sessions, page views, UNIT SESSION
-                                 PERCENTAGE (your real conversion rate)
-                                 and Buy Box percentage, per ASIN, per day.
-                                 This number has never been visible before.
-                                 Every plan so far assumed 5% or 8.3%.
-     run_report / get_report     Any SP-API report: returns, reimbursements,
-                                 inventory ledger, Search Query Performance,
-                                 estimated fees. Create-then-poll with GZIP
-                                 decompression handled inside the Worker.
-     get_competitive_pricing     Buy Box owner, lowest offer, offer count.
-     estimate_fees               Referral + FBA fee for ANY price and ANY
-                                 weight/dimensions, before you list.
-                                 This settles Gate 2 without guessing.
-     get_inbound_shipments       Track the 50 copper bottles in transit.
-     get_sales_metrics           Units and revenue by day/week/month.
+   WHAT WAS ACTUALLY BROKEN
+   run_report called createAndWait with reportOptions = undefined and a
+   rolling N-day window. Brand Analytics reports REQUIRE:
+       reportOptions.reportPeriod  =  WEEK | MONTH | QUARTER
+       dataStartTime / dataEndTime aligned EXACTLY to that period
+   A quarterly report cannot be built from "the last 30 days", so
+   Amazon rejected it at build time and returned a bare FATAL with no
+   reason attached. Waiting would never have fixed it.
 
-   WHY REPORTS ARE TWO TOOLS, NOT ONE
-   Amazon generates a report asynchronously. It can take 30 seconds or
-   ten minutes. A single tool that waits would time out and look broken.
-   run_report waits up to ~55s and returns the data if ready, or a
-   report_id. get_report(report_id) picks it up afterwards.
+   NEW IN v5
+     get_top_search_terms          Amazon's own search frequency rank and
+                                   the top-3 clicked products' CLICK SHARE
+                                   for every search term in a category.
+                                   Click share under ~12% means no product
+                                   owns the term. Copper water bottle was
+                                   8.03%; kosdeg 50.14%; cleo 67.60%.
+                                   This is the fragmentation gate.
+     get_search_query_performance  Impressions, clicks, cart adds and
+                                   purchases per query for your own ASINs.
+     get_search_catalog_performance  The same engagement funnel across the
+                                   whole catalogue.
+     get_market_basket             What customers buy alongside your ASIN.
+     get_repeat_purchase           Repeat purchase behaviour.
+     run_report                    Now accepts report_period + period_start
+                                   and passes reportOptions properly.
+
+   ALSO FIXED
+     createAndWait now returns Amazon's full report record, so a FATAL
+     comes back with whatever detail Amazon attached instead of silence.
+     periodWindow() snaps dates to real quarter, month and week edges.
 
    STILL IMPOSSIBLE, WHATEVER THE CODE DOES
-     Clicks, CPC, impressions, ACOS, keyword spend  → Amazon Ads API,
-       a SEPARATE application. Not obtainable here at any price.
-     Account Health score, reviews, star ratings, buyer messages
-       → not exposed by SP-API at all.
+     Clicks, CPC, impressions, ACOS, keyword spend → Amazon Ads API,
+       a SEPARATE application.
+     Account Health score, reviews, star ratings → not exposed by SP-API.
      Landed cost → Amazon never knows what you paid your supplier.
-     Deposit method settings → Seller Central screen only. This is why
-       the stuck CAD 37.40 must be fixed by hand.
+     Deposit method settings → Seller Central screen only.
 
-   CARRIED OVER FROM v3
-     Explicit per-event maths, no double counting (ads were 2x in v2).
-     by_settlement mode for complete financial data.
-     Real dates everywhere. Currency codes on settlements.
+   CARRIED OVER FROM v4
+     Explicit per-event maths, no double counting.
+     by_settlement mode. GZIP handled inside the Worker.
      Hard error above 720 days instead of a fake $0.00.
    ================================================================== */
 
@@ -60,6 +72,17 @@ const COGS: Record<string, number> = {
 };
 
 const MAX_FINANCE_DAYS = 720;
+
+/** Reports Amazon will not build without reportOptions.reportPeriod. */
+const PERIOD_REPORTS = new Set([
+	"GET_BRAND_ANALYTICS_SEARCH_TERMS_REPORT",
+	"GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT",
+	"GET_BRAND_ANALYTICS_SEARCH_CATALOG_PERFORMANCE_REPORT",
+	"GET_BRAND_ANALYTICS_REPEAT_PURCHASE_REPORT",
+	"GET_BRAND_ANALYTICS_MARKET_BASKET_REPORT",
+	"GET_BRAND_ANALYTICS_ITEM_COMPARISON_REPORT",
+	"GET_BRAND_ANALYTICS_ALTERNATE_PURCHASE_REPORT",
+]);
 
 let currentEnv: any = null;
 let cachedToken: string | null = null;
@@ -113,7 +136,7 @@ async function spRequest(method: string, path: string, body?: any): Promise<any>
 		}
 
 		const text = await res.text();
-		if (!res.ok) throw new Error("SP-API " + res.status + ": " + text.slice(0, 400));
+		if (!res.ok) throw new Error("SP-API " + res.status + ": " + text.slice(0, 600));
 		return text ? JSON.parse(text) : {};
 	}
 
@@ -133,6 +156,10 @@ function daysAgoISO(days: number): string {
 
 function money(n: number): string {
 	return n.toFixed(2);
+}
+
+function pct(n: number): string {
+	return (n * 100).toFixed(2) + "%";
 }
 
 function textResult(obj: any) {
@@ -191,6 +218,66 @@ function prettify(key: string): string {
 }
 
 /* ------------------------------------------------------------------ */
+/*  PERIOD ALIGNMENT — the v5 fix                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Brand Analytics reports are built per calendar period. The window has to
+ * land exactly on that period's edges — Q2 2026 is 2026-04-01 to 2026-06-30,
+ * not "the last 90 days". Passing a rolling window is what produced FATAL.
+ *
+ * anchor: any date inside the period you want, e.g. "2026-04-01".
+ *         Omit it and you get the most recently COMPLETED period, since the
+ *         current one is not published yet.
+ */
+function periodWindow(period: string, anchor?: string): { start: string; end: string; label: string } {
+	let d: Date;
+
+	if (anchor) {
+		d = new Date(anchor + "T00:00:00Z");
+	} else {
+		// Step back into the last completed period.
+		const now = new Date();
+		if (period === "QUARTER") {
+			d = new Date(Date.UTC(now.getUTCFullYear(), Math.floor(now.getUTCMonth() / 3) * 3 - 3, 1));
+		} else if (period === "MONTH") {
+			d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+		} else {
+			d = new Date(now.getTime() - 7 * 86400000);
+		}
+	}
+
+	const y = d.getUTCFullYear();
+	const m = d.getUTCMonth();
+	let start: Date;
+	let end: Date;
+	let label: string;
+
+	if (period === "QUARTER") {
+		const qStart = Math.floor(m / 3) * 3;
+		start = new Date(Date.UTC(y, qStart, 1));
+		end = new Date(Date.UTC(y, qStart + 3, 0));
+		label = y + " Q" + (Math.floor(qStart / 3) + 1);
+	} else if (period === "MONTH") {
+		start = new Date(Date.UTC(y, m, 1));
+		end = new Date(Date.UTC(y, m + 1, 0));
+		label = start.toISOString().slice(0, 7);
+	} else {
+		// Amazon weeks run Sunday to Saturday.
+		const dow = d.getUTCDay();
+		start = new Date(Date.UTC(y, m, d.getUTCDate() - dow));
+		end = new Date(Date.UTC(y, m, d.getUTCDate() - dow + 6));
+		label = "week of " + start.toISOString().slice(0, 10);
+	}
+
+	return {
+		start: start.toISOString().slice(0, 10) + "T00:00:00Z",
+		end: end.toISOString().slice(0, 10) + "T23:59:59Z",
+		label,
+	};
+}
+
+/* ------------------------------------------------------------------ */
 /*  REPORTS API — create, poll, download, decompress                   */
 /* ------------------------------------------------------------------ */
 
@@ -222,31 +309,59 @@ function parseTSV(text: string, limit = 500): any[] {
 	return rows;
 }
 
-/** Creates a report and waits for it, up to waitSeconds. */
+/**
+ * Creates a report and waits for it.
+ *
+ * v5: accepts an explicit window (for period-aligned Brand Analytics
+ * reports) and returns the FULL report record on failure, so a FATAL
+ * arrives with whatever Amazon attached rather than nothing at all.
+ */
 async function createAndWait(
 	reportType: string,
 	days: number,
 	reportOptions: any | undefined,
-	waitSeconds: number
+	waitSeconds: number,
+	explicitWindow?: { start: string; end: string }
 ) {
 	const body: any = {
 		reportType,
 		marketplaceIds: [MARKETPLACE_ID],
-		dataStartTime: daysAgoISO(days),
-		dataEndTime: new Date(Date.now() - 60000).toISOString(),
 	};
+
+	if (explicitWindow) {
+		body.dataStartTime = explicitWindow.start;
+		body.dataEndTime = explicitWindow.end;
+	} else {
+		body.dataStartTime = daysAgoISO(days);
+		body.dataEndTime = new Date(Date.now() - 60000).toISOString();
+	}
+
 	if (reportOptions) body.reportOptions = reportOptions;
 
-	const created = await spPost("/reports/2021-06-30/reports", body);
-	const reportId = created.reportId;
+	let created: any;
+	try {
+		created = await spPost("/reports/2021-06-30/reports", body);
+	} catch (e: any) {
+		// Amazon refused the REQUEST, not the build. This is the useful error.
+		return {
+			reportId: null,
+			status: "REQUEST_REJECTED",
+			documentId: null,
+			info: null,
+			sentBody: body,
+			rejectionMessage: e?.message || String(e),
+		};
+	}
 
+	const reportId = created.reportId;
 	const deadline = Date.now() + waitSeconds * 1000;
 	let status = "IN_QUEUE";
 	let documentId: string | null = null;
+	let info: any = null;
 
 	while (Date.now() < deadline) {
 		await new Promise((r) => setTimeout(r, 5000));
-		const info = await spGet("/reports/2021-06-30/reports/" + encodeURIComponent(reportId));
+		info = await spGet("/reports/2021-06-30/reports/" + encodeURIComponent(reportId));
 		status = info.processingStatus;
 		if (status === "DONE") {
 			documentId = info.reportDocumentId;
@@ -255,7 +370,82 @@ async function createAndWait(
 		if (status === "CANCELLED" || status === "FATAL") break;
 	}
 
-	return { reportId, status, documentId };
+	return { reportId, status, documentId, info, sentBody: body, rejectionMessage: null };
+}
+
+/**
+ * When a Brand Analytics report FAILS, Amazon sometimes still writes a
+ * document explaining why. Fetch it if it exists.
+ */
+async function fatalReason(info: any): Promise<string | null> {
+	try {
+		if (info?.reportDocumentId) {
+			const text = await downloadReportDocument(info.reportDocumentId);
+			return text.slice(0, 1200);
+		}
+	} catch {
+		/* nothing usable */
+	}
+	return null;
+}
+
+/** Shared handler for every Brand Analytics report. */
+async function runBrandAnalytics(
+	reportType: string,
+	period: string,
+	periodStart: string | undefined,
+	extraOptions: any,
+	waitSeconds: number
+) {
+	const win = periodWindow(period, periodStart);
+	const options = { reportPeriod: period, ...extraOptions };
+
+	const r = await createAndWait(reportType, 0, options, waitSeconds, win);
+
+	if (r.status === "REQUEST_REJECTED") {
+		return {
+			ok: false,
+			status: r.status,
+			report_type: reportType,
+			period: win.label,
+			window: { start: win.start, end: win.end },
+			report_options_sent: options,
+			amazon_message: r.rejectionMessage,
+			diagnosis:
+				"Amazon refused the request itself. If it mentions a role, the Brand Analytics role is not live on the app yet — re-Authorize and replace SP_REFRESH_TOKEN. If it mentions reportOptions, the option names below are wrong for this report type.",
+		};
+	}
+
+	if (r.status !== "DONE" || !r.documentId) {
+		const why = await fatalReason(r.info);
+		return {
+			ok: false,
+			status: r.status,
+			report_id: r.reportId,
+			report_type: reportType,
+			period: win.label,
+			window: { start: win.start, end: win.end },
+			report_options_sent: options,
+			amazon_detail: why,
+			diagnosis:
+				r.status === "FATAL"
+					? "Amazon accepted the request but could not build it. Two usual causes: (1) the Brand Analytics role is ticked on the app but the refresh token predates it — re-Authorize and replace SP_REFRESH_TOKEN; (2) the period is not published yet — try the previous quarter."
+					: "Still building. Call get_report with this report_id shortly.",
+		};
+	}
+
+	const raw = await downloadReportDocument(r.documentId);
+	const trimmed = raw.trim();
+	const data = trimmed.startsWith("{") || trimmed.startsWith("[") ? JSON.parse(trimmed) : parseTSV(raw, 2000);
+
+	return {
+		ok: true,
+		report_id: r.reportId,
+		report_type: reportType,
+		period: win.label,
+		window: { start: win.start, end: win.end },
+		data,
+	};
 }
 
 /* ------------------------------------------------------------------ */
@@ -450,8 +640,342 @@ async function collectEventsBySettlement(days: number) {
 function createServer() {
 	const server = new McpServer({
 		name: "AH Inside Seller Central",
-		version: "4.0.0",
+		version: "5.0.0",
 	});
+
+	/* ============ BRAND ANALYTICS — TOP SEARCH TERMS ============ */
+
+	server.registerTool(
+		"get_top_search_terms",
+		{
+			description:
+				"THE FRAGMENTATION GATE. Amazon's own Top Search Terms: search frequency rank plus the top-3 clicked products with their CLICK SHARE and CONVERSION SHARE, for every search term. A #1 click share under ~12% means no product owns that term and a newcomer can take share; over ~20% means one brand owns it and you walk away. Copper water bottle was 8.03%, kosdeg 50.14%, cleo 67.60%. First-party data — not an estimate from any third-party tool. Filter by category, or search a specific term.",
+			inputSchema: z.object({
+				period: z
+					.string()
+					.optional()
+					.describe("QUARTER, MONTH or WEEK. Default QUARTER."),
+				period_start: z
+					.string()
+					.optional()
+					.describe(
+						"Any date inside the wanted period, e.g. 2026-04-01 for Q2 2026. Omit for the most recently completed period."
+					),
+				contains: z
+					.string()
+					.optional()
+					.describe("Only return search terms containing this text, e.g. 'copper'."),
+				max_click_share: z
+					.number()
+					.optional()
+					.describe(
+						"Only return terms whose #1 clicked product has a click share BELOW this fraction. 0.12 applies the fragmentation gate."
+					),
+				max_rank: z
+					.number()
+					.optional()
+					.describe("Only return terms with a search frequency rank below this. 15000 is a sensible ceiling."),
+				max_rows: z.number().optional().describe("Rows to return. Default 300."),
+				wait_seconds: z.number().optional().describe("How long to wait. Default 80."),
+			}),
+		},
+		async ({ period, period_start, contains, max_click_share, max_rank, max_rows, wait_seconds }: any) => {
+			try {
+				const p = (period || "QUARTER").toUpperCase();
+				const wait = Math.max(5, Math.min(wait_seconds ?? 80, 110));
+				const limit = Math.max(1, Math.min(max_rows ?? 300, 2000));
+
+				const out = await runBrandAnalytics(
+					"GET_BRAND_ANALYTICS_SEARCH_TERMS_REPORT",
+					p,
+					period_start,
+					{},
+					wait
+				);
+
+				if (!out.ok) return textResult(out);
+
+				// Amazon nests the rows under a department-and-search-term key.
+				const d: any = out.data;
+				const rowsRaw: any[] = Array.isArray(d)
+					? d
+					: d.dataByDepartmentAndSearchTerm ||
+					  d.dataByDepartmentAndSearchTermV2 ||
+					  d.dataBySearchTerm ||
+					  [];
+
+				let rows = rowsRaw.map((r: any) => {
+					const rank = Number(r.searchFrequencyRank ?? r.searchFrequencyRankV2 ?? 0);
+					const c1 = Number(r.clickShare ?? r.clickedAsin1ClickShare ?? r.topClickedProduct1ClickShare ?? 0);
+					const v1 = Number(
+						r.conversionShare ?? r.clickedAsin1ConversionShare ?? r.topClickedProduct1ConversionShare ?? 0
+					);
+					return {
+						search_term: r.searchTerm ?? r.departmentAndSearchTerm ?? null,
+						department: r.departmentName ?? null,
+						search_frequency_rank: rank,
+						top1_asin: r.clickedAsin ?? r.clickedAsin1 ?? null,
+						top1_title: r.clickedItemName ?? r.clickedAsin1Title ?? null,
+						top1_click_share: c1,
+						top1_click_share_pct: pct(c1),
+						top1_conversion_share: v1,
+						top1_conversion_share_pct: pct(v1),
+						verdict:
+							c1 === 0 ? "unknown" : c1 < 0.12 ? "OPEN — nobody owns it" : c1 < 0.2 ? "concentrating" : "OWNED — walk away",
+						raw: r,
+					};
+				});
+
+				if (contains) {
+					const needle = String(contains).toLowerCase();
+					rows = rows.filter((r) => String(r.search_term || "").toLowerCase().includes(needle));
+				}
+				if (max_rank) rows = rows.filter((r) => r.search_frequency_rank && r.search_frequency_rank <= max_rank);
+				if (max_click_share) rows = rows.filter((r) => r.top1_click_share > 0 && r.top1_click_share <= max_click_share);
+
+				rows.sort((a, b) => (a.search_frequency_rank || 1e9) - (b.search_frequency_rank || 1e9));
+
+				const open = rows.filter((r) => r.top1_click_share > 0 && r.top1_click_share < 0.12).length;
+				const owned = rows.filter((r) => r.top1_click_share >= 0.2).length;
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					report_id: out.report_id,
+					period: out.period,
+					window: out.window,
+					total_terms_in_report: rowsRaw.length,
+					terms_after_filters: rows.length,
+					fragmentation: {
+						open_under_12pct: open,
+						owned_over_20pct: owned,
+					},
+					terms: rows.slice(0, limit).map(({ raw, ...rest }) => rest),
+					notes: [
+						"top1_click_share is the share of ALL clicks on this search term that went to the single most-clicked product. It is Amazon's own measurement.",
+						"Under 12% means the clicks are spread across many products — that is an enterable market.",
+						"Over 20% means one product absorbs most of the demand, which almost always means a brand search.",
+						"search_frequency_rank is a rank, not a volume: rank 1 is the most searched term on Amazon. Lower is bigger.",
+					],
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ============ BRAND ANALYTICS — SEARCH QUERY PERFORMANCE ============ */
+
+	server.registerTool(
+		"get_search_query_performance",
+		{
+			description:
+				"Per-query impressions, clicks, cart adds and purchases for YOUR OWN ASINs, with your share of each. This is the only place Amazon shows what a keyword actually did for your listing. Brand Registry required.",
+			inputSchema: z.object({
+				asins: z
+					.string()
+					.optional()
+					.describe("One ASIN or several separated by spaces or commas. Omit for brand level."),
+				period: z.string().optional().describe("QUARTER, MONTH or WEEK. Default QUARTER."),
+				period_start: z.string().optional().describe("Any date inside the wanted period, e.g. 2026-04-01."),
+				max_rows: z.number().optional().describe("Rows to return. Default 200."),
+				wait_seconds: z.number().optional().describe("How long to wait. Default 80."),
+			}),
+		},
+		async ({ asins, period, period_start, max_rows, wait_seconds }: any) => {
+			try {
+				const p = (period || "QUARTER").toUpperCase();
+				const wait = Math.max(5, Math.min(wait_seconds ?? 80, 110));
+				const limit = Math.max(1, Math.min(max_rows ?? 200, 1000));
+
+				const extra: any = {};
+				if (asins) {
+					extra.asin = String(asins).split(/[\s,]+/).filter(Boolean).join(" ");
+				}
+
+				const out = await runBrandAnalytics(
+					"GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT",
+					p,
+					period_start,
+					extra,
+					wait
+				);
+
+				if (!out.ok) return textResult(out);
+
+				const d: any = out.data;
+				const rowsRaw: any[] = Array.isArray(d) ? d : d.dataByAsin || d.dataByDepartmentAndSearchTerm || [];
+
+				const rows = rowsRaw.slice(0, limit).map((r: any) => ({
+					search_query: r.searchQuery ?? null,
+					query_volume: r.searchQueryData?.searchQueryVolume ?? null,
+					impressions_total: r.impressionData?.totalQueryImpressionCount ?? null,
+					impressions_yours: r.impressionData?.asinImpressionCount ?? null,
+					impression_share: r.impressionData?.asinImpressionShare ?? null,
+					clicks_total: r.clickData?.totalClickCount ?? null,
+					clicks_yours: r.clickData?.asinClickCount ?? null,
+					click_share: r.clickData?.asinClickShare ?? null,
+					cart_adds_yours: r.cartAddData?.asinCartAddCount ?? null,
+					purchases_total: r.purchaseData?.totalPurchaseCount ?? null,
+					purchases_yours: r.purchaseData?.asinPurchaseCount ?? null,
+					purchase_share: r.purchaseData?.asinPurchaseShare ?? null,
+					asin: r.asin ?? null,
+				}));
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					report_id: out.report_id,
+					period: out.period,
+					window: out.window,
+					asins_requested: extra.asin || "brand level",
+					rows_returned: rows.length,
+					queries: rows,
+					note:
+						"impression_share below click_share means the listing converts attention well but is not being shown enough — a ranking problem, not a listing problem.",
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ============ BRAND ANALYTICS — SEARCH CATALOG PERFORMANCE ============ */
+
+	server.registerTool(
+		"get_search_catalog_performance",
+		{
+			description:
+				"Search engagement across the whole catalogue: impressions, clicks, cart adds and purchases per ASIN for a period. Use it to see which SKUs are being found at all.",
+			inputSchema: z.object({
+				period: z.string().optional().describe("QUARTER, MONTH or WEEK. Default QUARTER."),
+				period_start: z.string().optional().describe("Any date inside the wanted period."),
+				max_rows: z.number().optional().describe("Rows to return. Default 200."),
+				wait_seconds: z.number().optional().describe("How long to wait. Default 80."),
+			}),
+		},
+		async ({ period, period_start, max_rows, wait_seconds }: any) => {
+			try {
+				const p = (period || "QUARTER").toUpperCase();
+				const wait = Math.max(5, Math.min(wait_seconds ?? 80, 110));
+				const limit = Math.max(1, Math.min(max_rows ?? 200, 1000));
+
+				const out = await runBrandAnalytics(
+					"GET_BRAND_ANALYTICS_SEARCH_CATALOG_PERFORMANCE_REPORT",
+					p,
+					period_start,
+					{},
+					wait
+				);
+
+				if (!out.ok) return textResult(out);
+
+				const d: any = out.data;
+				const rowsRaw: any[] = Array.isArray(d) ? d : d.dataByAsin || [];
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					report_id: out.report_id,
+					period: out.period,
+					window: out.window,
+					rows_returned: Math.min(rowsRaw.length, limit),
+					catalog: rowsRaw.slice(0, limit),
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ============ BRAND ANALYTICS — MARKET BASKET ============ */
+
+	server.registerTool(
+		"get_market_basket",
+		{
+			description:
+				"What customers bought alongside your ASINs in the same order. Useful for bundle decisions and for spotting the accessory a niche is missing.",
+			inputSchema: z.object({
+				period: z.string().optional().describe("QUARTER, MONTH or WEEK. Default QUARTER."),
+				period_start: z.string().optional().describe("Any date inside the wanted period."),
+				max_rows: z.number().optional().describe("Rows to return. Default 100."),
+				wait_seconds: z.number().optional().describe("How long to wait. Default 80."),
+			}),
+		},
+		async ({ period, period_start, max_rows, wait_seconds }: any) => {
+			try {
+				const p = (period || "QUARTER").toUpperCase();
+				const wait = Math.max(5, Math.min(wait_seconds ?? 80, 110));
+				const limit = Math.max(1, Math.min(max_rows ?? 100, 500));
+
+				const out = await runBrandAnalytics(
+					"GET_BRAND_ANALYTICS_MARKET_BASKET_REPORT",
+					p,
+					period_start,
+					{},
+					wait
+				);
+
+				if (!out.ok) return textResult(out);
+
+				const d: any = out.data;
+				const rowsRaw: any[] = Array.isArray(d) ? d : d.dataByAsin || [];
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					report_id: out.report_id,
+					period: out.period,
+					rows_returned: Math.min(rowsRaw.length, limit),
+					baskets: rowsRaw.slice(0, limit),
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ============ BRAND ANALYTICS — REPEAT PURCHASE ============ */
+
+	server.registerTool(
+		"get_repeat_purchase",
+		{
+			description:
+				"Repeat purchase behaviour per ASIN: unique customers, repeat customers and repeat purchase revenue. A consumable with no repeat rate is a warning about the product, not the marketing.",
+			inputSchema: z.object({
+				period: z.string().optional().describe("QUARTER, MONTH or WEEK. Default QUARTER."),
+				period_start: z.string().optional().describe("Any date inside the wanted period."),
+				max_rows: z.number().optional().describe("Rows to return. Default 100."),
+				wait_seconds: z.number().optional().describe("How long to wait. Default 80."),
+			}),
+		},
+		async ({ period, period_start, max_rows, wait_seconds }: any) => {
+			try {
+				const p = (period || "QUARTER").toUpperCase();
+				const wait = Math.max(5, Math.min(wait_seconds ?? 80, 110));
+				const limit = Math.max(1, Math.min(max_rows ?? 100, 500));
+
+				const out = await runBrandAnalytics(
+					"GET_BRAND_ANALYTICS_REPEAT_PURCHASE_REPORT",
+					p,
+					period_start,
+					{},
+					wait
+				);
+
+				if (!out.ok) return textResult(out);
+
+				const d: any = out.data;
+				const rowsRaw: any[] = Array.isArray(d) ? d : d.dataByAsin || [];
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					report_id: out.report_id,
+					period: out.period,
+					rows_returned: Math.min(rowsRaw.length, limit),
+					repeat_purchase: rowsRaw.slice(0, limit),
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
 
 	/* ================= INVENTORY ================= */
 
@@ -1195,45 +1719,90 @@ function createServer() {
 		"run_report",
 		{
 			description:
-				"Request any Amazon report and return it. Useful types: GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (why customers returned items — this is how to explain a high refund rate), GET_FBA_REIMBURSEMENTS_DATA (money Amazon owes for lost or damaged stock), GET_LEDGER_SUMMARY_VIEW_DATA (inventory movement), GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA (per-SKU fee estimates), GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT (real keyword impressions, clicks and purchases — Brand Registry only), GET_MERCHANT_LISTINGS_ALL_DATA. Returns a report_id if Amazon needs longer.",
+				"Request any Amazon report and return it. Useful types: GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (why customers returned items), GET_FBA_REIMBURSEMENTS_DATA (money Amazon owes for lost or damaged stock), GET_LEDGER_SUMMARY_VIEW_DATA (inventory movement), GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA (per-SKU fee estimates), GET_MERCHANT_LISTINGS_ALL_DATA. For any GET_BRAND_ANALYTICS_* report you MUST pass report_period (QUARTER, MONTH or WEEK) — prefer the dedicated get_top_search_terms and get_search_query_performance tools instead. Returns a report_id if Amazon needs longer.",
 			inputSchema: z.object({
 				report_type: z.string().describe("The Amazon report type, exactly as spelled above."),
-				days: z.number().optional().describe("Days to look back. Default 30."),
+				days: z.number().optional().describe("Days to look back. Default 30. Ignored for period reports."),
 				wait_seconds: z.number().optional().describe("How long to wait. Default 55."),
 				max_rows: z.number().optional().describe("Rows to return. Default 200."),
+				report_period: z
+					.string()
+					.optional()
+					.describe("QUARTER, MONTH or WEEK. REQUIRED for every GET_BRAND_ANALYTICS_* report."),
+				period_start: z
+					.string()
+					.optional()
+					.describe("Any date inside the wanted period, e.g. 2026-04-01. Omit for the last completed period."),
+				report_options: z
+					.string()
+					.optional()
+					.describe('Extra reportOptions as JSON, e.g. {"asin":"B0DS2V1TS6"}.'),
 			}),
 		},
-		async ({ report_type, days, wait_seconds, max_rows }: any) => {
+		async ({ report_type, days, wait_seconds, max_rows, report_period, period_start, report_options }: any) => {
 			try {
 				const window = Math.max(1, days ?? 30);
 				const wait = Math.max(5, Math.min(wait_seconds ?? 55, 110));
 				const limit = Math.max(1, Math.min(max_rows ?? 200, 1000));
 
-				const { reportId, status, documentId } = await createAndWait(
-					report_type,
-					window,
-					undefined,
-					wait
-				);
+				let extra: any = {};
+				if (report_options) {
+					try {
+						extra = JSON.parse(report_options);
+					} catch {
+						return textResult({ error: "report_options is not valid JSON", received: report_options });
+					}
+				}
 
-				if (status !== "DONE" || !documentId) {
+				const needsPeriod = PERIOD_REPORTS.has(report_type);
+
+				if (needsPeriod && !report_period) {
 					return textResult({
-						report_id: reportId,
+						error: "REPORT_PERIOD_REQUIRED",
 						report_type,
-						status,
 						message:
-							"Still building. Call get_report with this report_id shortly. FATAL usually means this account is not eligible for that report — Search Query Performance for example needs Brand Registry.",
+							"This report is built per calendar period. Pass report_period as QUARTER, MONTH or WEEK. Without it Amazon rejects the request at build time and returns a bare FATAL with no reason attached — which is exactly the failure v4 could not explain.",
 					});
 				}
 
-				const raw = await downloadReportDocument(documentId);
+				let result;
+				if (needsPeriod) {
+					const out = await runBrandAnalytics(report_type, report_period.toUpperCase(), period_start, extra, wait);
+					return textResult(out);
+				}
+
+				result = await createAndWait(report_type, window, Object.keys(extra).length ? extra : undefined, wait);
+
+				if (result.status === "REQUEST_REJECTED") {
+					return textResult({
+						status: result.status,
+						report_type,
+						amazon_message: result.rejectionMessage,
+						sent_body: result.sentBody,
+					});
+				}
+
+				if (result.status !== "DONE" || !result.documentId) {
+					const why = await fatalReason(result.info);
+					return textResult({
+						report_id: result.reportId,
+						report_type,
+						status: result.status,
+						amazon_detail: why,
+						sent_body: result.sentBody,
+						message:
+							"Still building, or Amazon could not build it. Call get_report with this report_id shortly. A FATAL on a Brand Analytics report almost always means the refresh token predates the Brand Analytics role — re-Authorize and replace SP_REFRESH_TOKEN.",
+					});
+				}
+
+				const raw = await downloadReportDocument(result.documentId);
 				const trimmed = raw.trim();
 
 				if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
 					return textResult({
 						pulled_at: new Date().toISOString(),
 						report_type,
-						report_id: reportId,
+						report_id: result.reportId,
 						format: "json",
 						data: JSON.parse(trimmed),
 					});
@@ -1243,7 +1812,7 @@ function createServer() {
 				return textResult({
 					pulled_at: new Date().toISOString(),
 					report_type,
-					report_id: reportId,
+					report_id: result.reportId,
 					format: "tsv",
 					total_lines: raw.split("\n").filter((l) => l.trim()).length - 1,
 					rows_returned: rows.length,
@@ -1260,7 +1829,7 @@ function createServer() {
 		"get_report",
 		{
 			description:
-				"Fetch a report that was requested earlier, using the report_id returned by run_report or get_traffic_and_conversion.",
+				"Fetch a report that was requested earlier, using the report_id returned by run_report, get_top_search_terms or get_traffic_and_conversion.",
 			inputSchema: z.object({
 				report_id: z.string().describe("The report_id from an earlier call."),
 				max_rows: z.number().optional().describe("Rows to return. Default 200."),
@@ -1272,13 +1841,15 @@ function createServer() {
 				const info = await spGet("/reports/2021-06-30/reports/" + encodeURIComponent(report_id));
 
 				if (info.processingStatus !== "DONE") {
+					const why = await fatalReason(info);
 					return textResult({
 						report_id,
 						status: info.processingStatus,
 						report_type: info.reportType,
+						amazon_detail: why,
 						message:
 							info.processingStatus === "FATAL"
-								? "Amazon could not build this report. Usually an eligibility problem — Search Query Performance needs Brand Registry, and some reports need a longer date range."
+								? "Amazon could not build this report. For a Brand Analytics type the usual cause is a refresh token issued before the Brand Analytics role was added — re-Authorize the app and replace SP_REFRESH_TOKEN. Otherwise check that the period is complete and published."
 								: "Not ready yet. Try again in a minute.",
 					});
 				}
@@ -1382,7 +1953,7 @@ function createServer() {
 		"estimate_fees",
 		{
 			description:
-				"Referral and FBA fees for any ASIN at any price, before you ever list it. This is the Gate 2 check without guessing: run it on a comparable copper bottle ASIN at 49.95 to see the real fee, and re-run it whenever the kit box dimensions change.",
+				"Referral and FBA fees for any ASIN at any price, before you ever list it. WARNING: Amazon returns the referral fee with a matching 'promotion' that nets it to zero, so the headline fee_percentage is understated by about 15 points. This tool adds the referral fee back and reports the TRUE total — use true_total_fees_pct for Gate 2, never fee_percentage.",
 			inputSchema: z.object({
 				asin: z.string().describe("The ASIN to price against — a competitor's is fine."),
 				price: z.number().describe("Selling price in USD, for example 49.95."),
@@ -1418,8 +1989,18 @@ function createServer() {
 					final_usd: money(amountOf(f.FinalFee)),
 				}));
 
-				const totalFees = amountOf(est.TotalFeesEstimate);
-				const net = price + (shipping ?? 0) - totalFees;
+				// v5: undo Amazon's phantom referral-fee promotion.
+				let referralGross = 0;
+				let fbaFee = 0;
+				for (const f of est.FeeDetailList || []) {
+					const t = f.FeeType;
+					if (t === "ReferralFee") referralGross += amountOf(f.FeeAmount);
+					else if (t === "FBAFees" || t === "FulfillmentFees") fbaFee += amountOf(f.FinalFee);
+				}
+
+				const reportedTotal = amountOf(est.TotalFeesEstimate);
+				const trueTotal = referralGross + fbaFee;
+				const trueNet = price + (shipping ?? 0) - trueTotal;
 
 				return textResult({
 					pulled_at: new Date().toISOString(),
@@ -1427,12 +2008,23 @@ function createServer() {
 					price_usd: money(price),
 					status: result.Status,
 					error: result.Error?.Message,
-					total_fees_usd: money(totalFees),
-					fee_percentage: price ? ((totalFees / price) * 100).toFixed(1) + "%" : "0.0%",
-					net_before_cogs_usd: money(net),
+
+					amazon_reported_total_usd: money(reportedTotal),
+					amazon_reported_pct: price ? ((reportedTotal / price) * 100).toFixed(1) + "%" : "0.0%",
+
+					referral_fee_usd: money(referralGross),
+					fba_fee_usd: money(fbaFee),
+					true_total_fees_usd: money(trueTotal),
+					true_total_fees_pct: price ? ((trueTotal / price) * 100).toFixed(1) + "%" : "0.0%",
+					net_before_cogs_usd: money(trueNet),
+
 					fee_breakdown: details,
-					note:
-						"Gate 2 wants fees under roughly 12-15% of price. This figure uses the dimensions of the ASIN you passed, so run it against a bottle of the same size as the finished kit box, not the bare bottle.",
+
+					notes: [
+						"USE true_total_fees_pct FOR GATE 2. Amazon zeroes the referral fee against a 'promotion' that does not exist for a normal seller; the headline percentage is therefore roughly 15 points too low.",
+						"Gate 2 wants referral + FBA at or under 30% of price.",
+						"This uses the dimensions of the ASIN passed in, so run it against a product the same size as the finished packed unit.",
+					],
 				});
 			} catch (e) {
 				return errorResult(e);
@@ -1446,7 +2038,7 @@ function createServer() {
 		"get_inbound_shipments",
 		{
 			description:
-				"FBA inbound shipments and their status — what is on the way to Amazon, what has been received, and what is stuck. Use this to track the 50 copper bottles once they ship.",
+				"FBA inbound shipments and their status — what is on the way to Amazon, what has been received, and what is stuck.",
 			inputSchema: z.object({
 				days: z.number().optional().describe("Days to look back. Default 180."),
 			}),
@@ -1593,6 +2185,60 @@ function createServer() {
 				};
 
 				return textResult({ pulled_at: new Date().toISOString(), key_flags: flags, ...data });
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================= LISTING RESTRICTIONS ================= */
+
+	server.registerTool(
+		"get_listings_restrictions",
+		{
+			description:
+				"Whether this account is allowed to list against a given ASIN, and if not, what approval is required. Run it BEFORE sourcing anything — a gated category found after the stock arrives is an expensive discovery.",
+			inputSchema: z.object({
+				asin: z.string().describe("The ASIN to test."),
+				condition: z.string().optional().describe("Condition type. Default new_new."),
+			}),
+		},
+		async ({ asin, condition }: any) => {
+			try {
+				const cond = condition || "new_new";
+				const data = await spGet(
+					"/listings/2021-08-01/restrictions?asin=" +
+						encodeURIComponent(asin) +
+						"&sellerId=" +
+						SELLER_ID +
+						"&marketplaceIds=" +
+						MARKETPLACE_ID +
+						"&conditionType=" +
+						encodeURIComponent(cond)
+				);
+
+				const restrictions = data?.restrictions || [];
+
+				return textResult({
+					pulled_at: new Date().toISOString(),
+					asin,
+					condition: cond,
+					restricted: restrictions.length > 0,
+					restriction_count: restrictions.length,
+					restrictions: restrictions.map((r: any) => ({
+						marketplace: r.marketplaceId,
+						condition: r.conditionType,
+						reasons: (r.reasons || []).map((x: any) => ({
+							message: x.message,
+							reason_code: x.reasonCode,
+							approval_links: (x.links || []).map((l: any) => l.resource),
+						})),
+					})),
+					verdict:
+						restrictions.length === 0
+							? "OPEN — this account can list against this ASIN today."
+							: "GATED — approval required before listing. Treat the category as closed unless the approval is realistic.",
+				});
 			} catch (e) {
 				return errorResult(e);
 			}
