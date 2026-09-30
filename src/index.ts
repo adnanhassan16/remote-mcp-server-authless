@@ -52,7 +52,8 @@ const SELLER_ID = "A2ZPQEA709W727";
 
    STILL IMPOSSIBLE, WHATEVER THE CODE DOES
      Clicks, CPC, impressions, ACOS, keyword spend → Amazon Ads API,
-       a SEPARATE application.
+       a SEPARATE application. (v6, 29 Sep 2026: now connected — see
+       the ADS v1 section below.)
      Account Health score, reviews, star ratings → not exposed by SP-API.
      Landed cost → Amazon never knows what you paid your supplier.
      Deposit method settings → Seller Central screen only.
@@ -633,6 +634,443 @@ async function collectEventsBySettlement(days: number) {
 	return { groups, pages, hitPageLimit, settlementsRead: groupIds.length };
 }
 
+/* ==================================================================
+   ADS v1 — 29 September 2026 — Amazon Ads API (Sponsored Products)
+
+   Uses its OWN Login with Amazon app ("AH Inside Ads API"), not the
+   SP-API app. The SP-API keys cannot carry the advertising scope.
+
+   Cloudflare secrets (Settings → Variables and Secrets):
+     ADS_CLIENT_ID       Client ID of the AH Inside Ads API security profile
+     ADS_CLIENT_SECRET   Client Secret of the same profile
+     ADS_REFRESH_TOKEN   Shown once by the /ads-callback page after "Allow"
+   Optional plain variables:
+     ADS_PROFILE_ID        Force one advertising profile (default: the US seller profile)
+     ADS_MAX_BID           Highest bid the Worker will ever send (default 1.07)
+     ADS_MAX_DAILY_BUDGET  Highest daily budget it will ever set (default 10)
+
+   GUARDRAILS — enforced here, whatever the chat asks for:
+     1. Manual campaigns and EXACT-match keywords only. No auto, broad or phrase.
+     2. No bid above ADS_MAX_BID (90% of break-even CPC; pantry baskets $1.07).
+     3. An existing keyword's bid can only go DOWN.
+     4. No daily budget above ADS_MAX_DAILY_BUDGET.
+     5. New campaigns are created PAUSED, with dynamic bids "down only".
+     6. Every write returns a PREVIEW. Nothing changes unless confirm = true.
+     7. Keywords are never archived (deleted), only paused.
+   Reports flag any keyword or search term with 86+ clicks and fewer
+   than 3 orders for pausing (Part 12).
+   ================================================================== */
+
+const ADS_HOST = "https://advertising-api.amazon.com";
+const ADS_CALLBACK_PATH = "/ads-callback";
+const PAUSE_MIN_CLICKS = 86;
+const PAUSE_MAX_ORDERS = 3;
+
+const ADS_TYPE = {
+	campaign: "application/vnd.spCampaign.v3+json",
+	adGroup: "application/vnd.spAdGroup.v3+json",
+	keyword: "application/vnd.spKeyword.v3+json",
+	negativeKeyword: "application/vnd.spNegativeKeyword.v3+json",
+	productAd: "application/vnd.spProductAd.v3+json",
+	report: "application/vnd.createasyncreportrequest.v3+json",
+};
+
+let adsToken: string | null = null;
+let adsTokenExpiry = 0;
+let adsProfileId: string | null = null;
+
+function adsLimits() {
+	const bid = Number(currentEnv?.ADS_MAX_BID ?? 1.07);
+	const budget = Number(currentEnv?.ADS_MAX_DAILY_BUDGET ?? 10);
+	return {
+		maxBid: Number.isFinite(bid) && bid > 0 ? bid : 1.07,
+		maxDailyBudget: Number.isFinite(budget) && budget > 0 ? budget : 10,
+	};
+}
+
+function adsSecretsMissing(): string | null {
+	const missing = ["ADS_CLIENT_ID", "ADS_CLIENT_SECRET", "ADS_REFRESH_TOKEN"].filter(
+		(k) => !currentEnv?.[k]
+	);
+	return missing.length
+		? "Amazon Ads secrets missing: " +
+				missing.join(", ") +
+				". Add them in Cloudflare → Workers → remote-mcp-server-authless → Settings → Variables and Secrets."
+		: null;
+}
+
+async function getAdsToken(): Promise<string> {
+	const missing = adsSecretsMissing();
+	if (missing) throw new Error(missing);
+
+	const now = Date.now();
+	if (adsToken && now < adsTokenExpiry) return adsToken;
+
+	const res = await fetch("https://api.amazon.com/auth/o2/token", {
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			grant_type: "refresh_token",
+			refresh_token: currentEnv.ADS_REFRESH_TOKEN,
+			client_id: currentEnv.ADS_CLIENT_ID,
+			client_secret: currentEnv.ADS_CLIENT_SECRET,
+		}).toString(),
+	});
+	if (!res.ok) throw new Error("Ads token request failed " + res.status + ": " + (await res.text()));
+
+	const data: any = await res.json();
+	adsToken = data.access_token;
+	adsTokenExpiry = now + (data.expires_in - 120) * 1000;
+	return adsToken as string;
+}
+
+async function adsRequest(
+	method: string,
+	path: string,
+	opts: { body?: any; type?: string; scoped?: boolean } = {}
+): Promise<any> {
+	const token = await getAdsToken();
+	const headers: Record<string, string> = {
+		Authorization: "Bearer " + token,
+		"Amazon-Advertising-API-ClientId": currentEnv.ADS_CLIENT_ID,
+	};
+	if (opts.scoped !== false) headers["Amazon-Advertising-API-Scope"] = await getAdsProfileId();
+	if (opts.type) {
+		headers["Content-Type"] = opts.type;
+		headers["Accept"] = opts.type;
+	} else if (opts.body) {
+		headers["Content-Type"] = "application/json";
+	}
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const res = await fetch(ADS_HOST + path, {
+			method,
+			headers,
+			body: opts.body ? JSON.stringify(opts.body) : undefined,
+		});
+		if (res.status === 429 || res.status >= 500) {
+			await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+			continue;
+		}
+		const text = await res.text();
+		if (!res.ok) throw new Error("Ads API " + res.status + ": " + text.slice(0, 800));
+		return text ? JSON.parse(text) : {};
+	}
+	throw new Error("Ads API throttled after 4 attempts");
+}
+
+async function listAdsProfiles(): Promise<any[]> {
+	const out = await adsRequest("GET", "/v2/profiles", { scoped: false });
+	return Array.isArray(out) ? out : [];
+}
+
+/** The US seller profile, unless ADS_PROFILE_ID says otherwise. */
+async function getAdsProfileId(): Promise<string> {
+	if (currentEnv?.ADS_PROFILE_ID) return String(currentEnv.ADS_PROFILE_ID);
+	if (adsProfileId) return adsProfileId;
+
+	const profiles = await listAdsProfiles();
+	const us = profiles.filter((p) => p.countryCode === "US");
+	const pick = us.find((p) => p.accountInfo?.type === "seller") || us[0];
+	if (!pick) {
+		throw new Error(
+			"No US advertising profile found on this Amazon account. Profiles returned: " +
+				JSON.stringify(profiles.map((p) => ({ id: p.profileId, country: p.countryCode, type: p.accountInfo?.type })))
+		);
+	}
+	adsProfileId = String(pick.profileId);
+	return adsProfileId;
+}
+
+/** Sponsored Products v3 list endpoints, all pages. */
+async function adsList(path: string, type: string, key: string, filter: any = {}): Promise<any[]> {
+	const items: any[] = [];
+	let nextToken: string | undefined;
+	for (let page = 0; page < 10; page++) {
+		const body: any = { maxResults: 1000, ...filter };
+		if (nextToken) body.nextToken = nextToken;
+		const out = await adsRequest("POST", path, { body, type });
+		items.push(...(out[key] || []));
+		nextToken = out.nextToken;
+		if (!nextToken) break;
+	}
+	return items;
+}
+
+/** v3 writes answer { key: { success: [...], error: [...] } }. */
+function adsWriteResult(out: any, key: string) {
+	const block = out?.[key] || {};
+	return { success: block.success || [], error: block.error || [] };
+}
+
+const LIVE_STATES = { include: ["ENABLED", "PAUSED"] };
+
+function todayISODate(): string {
+	return new Date().toISOString().slice(0, 10);
+}
+
+function cleanKeyword(text: string): string {
+	return String(text || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/** Checks a set of new exact keywords against the bid cap. */
+function checkNewKeywords(keywords: { text: string; bid: number }[], maxBid: number): string[] {
+	const problems: string[] = [];
+	const seen = new Set<string>();
+	for (const k of keywords) {
+		const t = cleanKeyword(k.text);
+		if (!t) problems.push("Empty keyword.");
+		if (t.split(" ").length > 10) problems.push('"' + t + '" has more than 10 words.');
+		if (seen.has(t)) problems.push('"' + t + '" is listed twice.');
+		seen.add(t);
+		if (!(k.bid > 0)) problems.push('"' + t + '" has no bid.');
+		if (k.bid < 0.02) problems.push('"' + t + '" bid $' + money(k.bid) + " is below Amazon's $0.02 minimum.");
+		if (k.bid > maxBid)
+			problems.push('"' + t + '" bid $' + money(k.bid) + " is above the $" + money(maxBid) + " bid cap.");
+	}
+	return problems;
+}
+
+/* ---------------- REPORTS (v3, asynchronous) ---------------- */
+
+const ADS_REPORTS: Record<string, { reportTypeId: string; groupBy: string[]; columns: string[] }> = {
+	campaigns: {
+		reportTypeId: "spCampaigns",
+		groupBy: ["campaign"],
+		columns: [
+			"campaignName", "campaignId", "campaignStatus", "campaignBudgetAmount",
+			"impressions", "clicks", "cost", "purchases7d", "sales7d", "unitsSoldClicks7d",
+		],
+	},
+	keywords: {
+		reportTypeId: "spTargeting",
+		groupBy: ["targeting"],
+		columns: [
+			"campaignName", "campaignId", "adGroupName", "adGroupId", "keywordId", "keyword",
+			"matchType", "targeting", "impressions", "clicks", "cost", "purchases7d", "sales7d",
+			"unitsSoldClicks7d",
+		],
+	},
+	search_terms: {
+		reportTypeId: "spSearchTerm",
+		groupBy: ["searchTerm"],
+		columns: [
+			"campaignName", "campaignId", "adGroupName", "adGroupId", "keywordId", "keyword",
+			"matchType", "searchTerm", "impressions", "clicks", "cost", "purchases7d", "sales7d",
+			"unitsSoldClicks7d",
+		],
+	},
+};
+
+async function adsCreateReport(kind: string, startDate: string, endDate: string) {
+	const cfg = ADS_REPORTS[kind];
+	return adsRequest("POST", "/reporting/reports", {
+		type: ADS_TYPE.report,
+		body: {
+			name: "AH Inside " + kind + " " + startDate + " to " + endDate,
+			startDate,
+			endDate,
+			configuration: {
+				adProduct: "SPONSORED_PRODUCTS",
+				groupBy: cfg.groupBy,
+				columns: cfg.columns,
+				reportTypeId: cfg.reportTypeId,
+				timeUnit: "SUMMARY",
+				format: "GZIP_JSON",
+			},
+		},
+	});
+}
+
+
+/** Polls a report; downloads and summarises it once COMPLETED. */
+async function adsFetchReport(reportId: string, kind: string, waitSeconds: number) {
+	const deadline = Date.now() + waitSeconds * 1000;
+	let info: any = await adsRequest("GET", "/reporting/reports/" + encodeURIComponent(reportId));
+	while (info.status !== "COMPLETED" && info.status !== "FAILED" && Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 8000));
+		info = await adsRequest("GET", "/reporting/reports/" + encodeURIComponent(reportId));
+	}
+
+	if (info.status === "FAILED") {
+		return { report_id: reportId, status: "FAILED", reason: info.failureReason || null };
+	}
+	if (info.status !== "COMPLETED") {
+		return {
+			report_id: reportId,
+			status: info.status,
+			next_step: "Amazon is still building it. Call ads_get_report with this report_id in a few minutes.",
+		};
+	}
+
+	const res = await fetch(info.url);
+	if (!res.ok) throw new Error("Ads report download failed " + res.status);
+	const text = await new Response(res.body!.pipeThrough(new DecompressionStream("gzip"))).text();
+	const rows: any[] = text ? JSON.parse(text) : [];
+	return { report_id: reportId, status: "COMPLETED", ...summariseAdsRows(rows, kind) };
+}
+
+function summariseAdsRows(rows: any[], kind: string) {
+	const { maxBid } = adsLimits();
+	let clicks = 0, cost = 0, sales = 0, orders = 0, impressions = 0;
+
+	const out = rows.map((r) => {
+		const c = Number(r.clicks || 0);
+		const spend = Number(r.cost || 0);
+		const s = Number(r.sales7d || 0);
+		const o = Number(r.purchases7d || 0);
+		clicks += c; cost += spend; sales += s; orders += o; impressions += Number(r.impressions || 0);
+
+		const row: any = {
+			...r,
+			cpc: c ? money(spend / c) : null,
+			acos: s ? pct(spend / s) : spend ? "no sales" : null,
+			cvr: c ? pct(o / c) : null,
+		};
+		if (kind !== "campaigns") {
+			if (c >= PAUSE_MIN_CLICKS && o < PAUSE_MAX_ORDERS) row.flag = "PAUSE: " + c + " clicks, " + o + " orders";
+			if (kind === "search_terms" && c >= 10 && o === 0 && !row.flag) row.flag = "WATCH: negative candidate";
+			if (kind === "search_terms" && o >= 2 && String(r.matchType || "").toUpperCase() !== "EXACT")
+				row.flag = "HARVEST: add as exact keyword";
+		}
+		return row;
+	});
+
+	out.sort((a, b) => Number(b.cost || 0) - Number(a.cost || 0));
+
+	return {
+		kind,
+		rows: out.length,
+		totals: {
+			impressions,
+			clicks,
+			spend: money(cost),
+			sales_7d: money(sales),
+			orders_7d: orders,
+			acos: sales ? pct(cost / sales) : null,
+			cpc: clicks ? money(cost / clicks) : null,
+			cvr: clicks ? pct(orders / clicks) : null,
+		},
+		rules: {
+			bid_cap: money(maxBid),
+			pause_rule: PAUSE_MIN_CLICKS + " clicks with fewer than " + PAUSE_MAX_ORDERS + " orders",
+			attribution: "Orders and sales are Amazon's 7-day click attribution.",
+		},
+		flagged: out.filter((r) => r.flag).slice(0, 100),
+		data: out.slice(0, 300),
+	};
+}
+
+/* ---------------- AUTHORIZATION CALLBACK PAGE ---------------- */
+
+function htmlEscape(s: string): string {
+	return String(s).replace(/[&<>"']/g, (c) =>
+		({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string
+	);
+}
+
+function callbackPage(title: string, body: string, status = 200): Response {
+	const html =
+		'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+		"<title>" + htmlEscape(title) + "</title><style>" +
+		"body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.5;color:#1a1a1a}" +
+		"textarea{width:100%;height:110px;font-family:monospace;font-size:13px}" +
+		"button{padding:10px 16px;font-size:15px;margin-top:8px;cursor:pointer}" +
+		".ok{color:#0a7a2f}.bad{color:#b00020}code{background:#f2f2f2;padding:1px 4px}" +
+		"</style></head><body>" + body + "</body></html>";
+	return new Response(html, {
+		status,
+		headers: {
+			"Content-Type": "text/html; charset=utf-8",
+			"Cache-Control": "no-store",
+			"Referrer-Policy": "no-referrer",
+			"X-Robots-Tag": "noindex",
+		},
+	});
+}
+
+/** Amazon sends the browser here after "Allow". Swaps the one-time code for a refresh token. */
+async function handleAdsCallback(url: URL): Promise<Response> {
+	const error = url.searchParams.get("error");
+	if (error) {
+		return callbackPage(
+			"Not connected",
+			'<h2 class="bad">Amazon did not grant access</h2><p>' +
+				htmlEscape(error + ": " + (url.searchParams.get("error_description") || "")) +
+				"</p><p>Close this page. Nothing was changed.</p>",
+			400
+		);
+	}
+
+	const code = url.searchParams.get("code");
+	if (!code) return callbackPage("Nothing to do", "<p>This page is only used after Amazon's Allow screen.</p>", 400);
+
+	if (!currentEnv?.ADS_CLIENT_ID || !currentEnv?.ADS_CLIENT_SECRET) {
+		return callbackPage(
+			"Secrets missing",
+			'<h2 class="bad">Add the Client ID and Client Secret first</h2>' +
+				"<p>In Cloudflare, add the secrets <code>ADS_CLIENT_ID</code> and <code>ADS_CLIENT_SECRET</code>, wait one minute, then open the Amazon link again and click Allow.</p>",
+			400
+		);
+	}
+
+	const res = await fetch("https://api.amazon.com/auth/o2/token", {
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			grant_type: "authorization_code",
+			code,
+			redirect_uri: url.origin + ADS_CALLBACK_PATH,
+			client_id: currentEnv.ADS_CLIENT_ID,
+			client_secret: currentEnv.ADS_CLIENT_SECRET,
+		}).toString(),
+	});
+	const data: any = await res.json().catch(() => ({}));
+	if (!res.ok || !data.refresh_token) {
+		return callbackPage(
+			"Not connected",
+			'<h2 class="bad">Amazon refused the code</h2><p>' +
+				htmlEscape(String(data.error || res.status) + " " + String(data.error_description || "")) +
+				"</p><p>The code works once and expires in 5 minutes. Open the Amazon link again and click Allow.</p>",
+			400
+		);
+	}
+
+	// Prove the token works by listing the advertising profiles it can see.
+	let profilesHtml = "";
+	try {
+		const p = await fetch(ADS_HOST + "/v2/profiles", {
+			headers: {
+				Authorization: "Bearer " + data.access_token,
+				"Amazon-Advertising-API-ClientId": currentEnv.ADS_CLIENT_ID,
+			},
+		});
+		const list: any[] = p.ok ? await p.json() : [];
+		profilesHtml = list.length
+			? "<p>Advertising profiles found:</p><ul>" +
+				list
+					.map((x) =>
+						"<li>" + htmlEscape(String(x.countryCode) + " · " + String(x.accountInfo?.type) + " · " +
+							String(x.accountInfo?.name || "") + " · profile " + String(x.profileId)) + "</li>"
+					)
+					.join("") + "</ul>"
+			: '<p class="bad">Token works, but Amazon returned no advertising profiles. Open Campaign Manager once with this account, then try again.</p>';
+	} catch {
+		profilesHtml = "<p>Could not list profiles right now; the token is still valid.</p>";
+	}
+
+	return callbackPage(
+		"Connected",
+		'<h2 class="ok">Amazon Ads connected ✅</h2>' +
+			profilesHtml +
+			"<p><b>Last step.</b> Copy the refresh token below and save it in Cloudflare as a <b>Secret</b> named <code>ADS_REFRESH_TOKEN</code>. " +
+			"Do not paste it into any chat, email or photo.</p>" +
+			'<textarea id="t" readonly>' + htmlEscape(data.refresh_token) + "</textarea><br>" +
+			"<button onclick=\"navigator.clipboard.writeText(document.getElementById('t').value);this.textContent='Copied'\">Copy token</button>" +
+			"<p>Then close this page. Amazon shows this token only once; if you lose it, open the Amazon link again and click Allow.</p>"
+	);
+}
+
 /* ------------------------------------------------------------------ */
 /*  SERVER                                                             */
 /* ------------------------------------------------------------------ */
@@ -640,7 +1078,7 @@ async function collectEventsBySettlement(days: number) {
 function createServer() {
 	const server = new McpServer({
 		name: "AH Inside Seller Central",
-		version: "5.0.0",
+		version: "6.0.0",
 	});
 
 	/* ============ BRAND ANALYTICS — TOP SEARCH TERMS ============ */
@@ -2350,6 +2788,496 @@ function createServer() {
 		}
 	);
 
+	/* ================================================================
+	   AMAZON ADS — Sponsored Products (ADS v1, 29 Sep 2026)
+	   Reads run freely. Writes preview first; confirm = true applies.
+	   ================================================================ */
+
+	server.registerTool(
+		"ads_list_profiles",
+		{
+			description:
+				"Amazon Ads: lists the advertising profiles this account can reach and shows which one the tools use (the US seller profile), plus the guardrail limits in force (bid cap, daily budget ceiling). Run this first to confirm the Ads connection works.",
+			inputSchema: z.object({}),
+		},
+		async () => {
+			try {
+				const profiles = await listAdsProfiles();
+				const using = await getAdsProfileId();
+				const { maxBid, maxDailyBudget } = adsLimits();
+				return textResult({
+					using_profile: using,
+					profiles: profiles.map((p) => ({
+						profileId: p.profileId,
+						country: p.countryCode,
+						currency: p.currencyCode,
+						type: p.accountInfo?.type,
+						name: p.accountInfo?.name,
+					})),
+					guardrails: {
+						bid_cap: money(maxBid),
+						max_daily_budget: money(maxDailyBudget),
+						match_types_allowed: "EXACT only (negatives: exact or phrase)",
+						bid_changes: "down only on existing keywords",
+						new_campaigns: "created PAUSED, dynamic bids down only",
+						writes: "preview unless confirm = true",
+					},
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_account_overview",
+		{
+			description:
+				"Amazon Ads: every Sponsored Products campaign (state, daily budget, bidding strategy), its ad groups (default bid), advertised SKUs, keywords (text, match type, bid, state) and negative keywords. Archived items are hidden. Optionally limit to one campaign_id. Use it before any change, and to see current bids.",
+			inputSchema: z.object({
+				campaign_id: z.string().optional().describe("Only this campaign."),
+			}),
+		},
+		async ({ campaign_id }: any) => {
+			try {
+				const byCampaign = campaign_id ? { campaignIdFilter: { include: [String(campaign_id)] } } : {};
+				const [campaigns, adGroups, productAds, keywords, negatives] = await Promise.all([
+					adsList("/sp/campaigns/list", ADS_TYPE.campaign, "campaigns", { stateFilter: LIVE_STATES, ...byCampaign }),
+					adsList("/sp/adGroups/list", ADS_TYPE.adGroup, "adGroups", { stateFilter: LIVE_STATES, ...byCampaign }),
+					adsList("/sp/productAds/list", ADS_TYPE.productAd, "productAds", { stateFilter: LIVE_STATES, ...byCampaign }),
+					adsList("/sp/keywords/list", ADS_TYPE.keyword, "keywords", { stateFilter: LIVE_STATES, ...byCampaign }),
+					adsList("/sp/negativeKeywords/list", ADS_TYPE.negativeKeyword, "negativeKeywords", {
+						stateFilter: LIVE_STATES,
+						...byCampaign,
+					}),
+				]);
+				const { maxBid, maxDailyBudget } = adsLimits();
+
+				return textResult({
+					guardrails: { bid_cap: money(maxBid), max_daily_budget: money(maxDailyBudget) },
+					campaigns: campaigns.map((c) => ({
+						campaignId: c.campaignId,
+						name: c.name,
+						state: c.state,
+						targeting: c.targetingType,
+						daily_budget: c.budget?.budget,
+						bidding: c.dynamicBidding?.strategy,
+						startDate: c.startDate,
+						ad_groups: adGroups
+							.filter((g) => g.campaignId === c.campaignId)
+							.map((g) => ({
+								adGroupId: g.adGroupId,
+								name: g.name,
+								state: g.state,
+								default_bid: g.defaultBid,
+								skus: productAds
+									.filter((a) => a.adGroupId === g.adGroupId)
+									.map((a) => ({ adId: a.adId, sku: a.sku, asin: a.asin, state: a.state })),
+								keywords: keywords
+									.filter((k) => k.adGroupId === g.adGroupId)
+									.map((k) => ({
+										keywordId: k.keywordId,
+										text: k.keywordText,
+										match: k.matchType,
+										bid: k.bid ?? g.defaultBid,
+										state: k.state,
+										over_cap: Number(k.bid ?? g.defaultBid) > maxBid ? "YES — lower it" : undefined,
+									})),
+							})),
+						negatives: negatives
+							.filter((n) => n.campaignId === c.campaignId)
+							.map((n) => ({ keywordId: n.keywordId, text: n.keywordText, match: n.matchType, adGroupId: n.adGroupId })),
+						not_exact_only: c.targetingType !== "MANUAL" ? "AUTO campaign — breaks the exact-only rule" : undefined,
+					})),
+					counts: {
+						campaigns: campaigns.length,
+						ad_groups: adGroups.length,
+						keywords: keywords.length,
+						negatives: negatives.length,
+					},
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_request_report",
+		{
+			description:
+				"Amazon Ads performance report (Sponsored Products, 7-day attribution). kind = campaigns | keywords | search_terms. Returns spend, clicks, orders, sales, ACOS, CPC and CVR per row with totals, and FLAGS rows to act on: PAUSE (86+ clicks, <3 orders), WATCH (10+ clicks, 0 orders — negative candidate), HARVEST (search term with 2+ orders not yet an exact keyword). Amazon builds reports asynchronously: if it is not ready within wait_seconds you get a report_id — call ads_get_report with it later. Max 31 days per report; data is kept about 60–95 days.",
+			inputSchema: z.object({
+				kind: z.enum(["campaigns", "keywords", "search_terms"]),
+				start_date: z.string().optional().describe("YYYY-MM-DD. Default 30 days ago."),
+				end_date: z.string().optional().describe("YYYY-MM-DD. Default yesterday."),
+				wait_seconds: z.number().optional().describe("Default 60, max 100."),
+			}),
+		},
+		async ({ kind, start_date, end_date, wait_seconds }: any) => {
+			try {
+				const end = end_date || new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+				const start = start_date || new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+				const span = (Date.parse(end) - Date.parse(start)) / 86400000;
+				if (!(span >= 0)) return errorResult(new Error("start_date must be on or before end_date (YYYY-MM-DD)."));
+				if (span > 30) return errorResult(new Error("Amazon allows at most 31 days per report. Split the range."));
+
+				const created = await adsCreateReport(kind, start, end);
+				const wait = Math.max(5, Math.min(wait_seconds ?? 60, 100));
+				return textResult({ start_date: start, end_date: end, ...(await adsFetchReport(created.reportId, kind, wait)) });
+			} catch (e: any) {
+				const m = String(e?.message || e);
+				const dup = m.match(/duplicate of\s*:?\s*([0-9a-f-]{36})/i);
+				if (dup) {
+					return textResult({
+						note: "Amazon already has this exact report. Use ads_get_report with this id.",
+						report_id: dup[1],
+					});
+				}
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_get_report",
+		{
+			description:
+				"Fetch an Amazon Ads report started earlier by ads_request_report. Pass the report_id and the same kind.",
+			inputSchema: z.object({
+				report_id: z.string(),
+				kind: z.enum(["campaigns", "keywords", "search_terms"]),
+				wait_seconds: z.number().optional().describe("Default 30, max 100."),
+			}),
+		},
+		async ({ report_id, kind, wait_seconds }: any) => {
+			try {
+				const wait = Math.max(0, Math.min(wait_seconds ?? 30, 100));
+				return textResult(await adsFetchReport(report_id, kind, wait));
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_create_exact_campaign",
+		{
+			description:
+				"WRITE (guarded). Builds one Sponsored Products launch campaign in a single step: MANUAL campaign (created PAUSED, dynamic bids 'down only'), one ad group, the SKU as the product ad, and EXACT-match keywords. Rejects any bid above the bid cap and any budget above the daily ceiling. Without confirm = true it only returns a preview. The campaign stays PAUSED until ads_update_campaign sets it ENABLED — turning ads on is Adnan's decision.",
+			inputSchema: z.object({
+				campaign_name: z.string(),
+				sku: z.string().describe("Seller SKU of the product to advertise."),
+				daily_budget: z.number(),
+				default_bid: z.number().describe("Ad group default bid; must be at or below the bid cap."),
+				keywords: z
+					.array(z.object({ text: z.string(), bid: z.number().optional() }))
+					.min(1)
+					.max(200)
+					.describe("Exact keywords. A keyword without a bid uses default_bid."),
+				confirm: z.boolean().optional().describe("true = create it. Omit to preview."),
+			}),
+		},
+		async ({ campaign_name, sku, daily_budget, default_bid, keywords, confirm }: any) => {
+			try {
+				const { maxBid, maxDailyBudget } = adsLimits();
+				const kws = keywords.map((k: any) => ({ text: cleanKeyword(k.text), bid: Number(k.bid ?? default_bid) }));
+				const problems = checkNewKeywords(kws, maxBid);
+				if (!(default_bid > 0) || default_bid > maxBid)
+					problems.push("default_bid $" + money(Number(default_bid)) + " must be above 0 and at or below the $" + money(maxBid) + " cap.");
+				if (!(daily_budget >= 1) || daily_budget > maxDailyBudget)
+					problems.push("daily_budget $" + money(Number(daily_budget)) + " must be $1.00–$" + money(maxDailyBudget) + ".");
+				if (!String(sku || "").trim()) problems.push("sku is required.");
+
+				const plan = {
+					campaign: { name: campaign_name, targeting: "MANUAL", state: "PAUSED", daily_budget: money(daily_budget), bidding: "Dynamic bids - down only" },
+					ad_group: { name: campaign_name + " - exact", default_bid: money(default_bid) },
+					product_ad: { sku },
+					keywords: kws.map((k: any) => ({ text: k.text, match: "EXACT", bid: money(k.bid) })),
+					max_spend_per_day: money(daily_budget),
+				};
+				if (problems.length) return textResult({ status: "REJECTED — nothing created", problems, plan });
+				if (!confirm) return textResult({ status: "PREVIEW — nothing created. Call again with confirm = true.", plan });
+
+				const created: any = { status: "CREATED (PAUSED — no spend until enabled)" };
+
+				const c = adsWriteResult(
+					await adsRequest("POST", "/sp/campaigns", {
+						type: ADS_TYPE.campaign,
+						body: {
+							campaigns: [
+								{
+									name: campaign_name,
+									targetingType: "MANUAL",
+									state: "PAUSED",
+									startDate: todayISODate(),
+									budget: { budgetType: "DAILY", budget: Number(daily_budget) },
+									dynamicBidding: { strategy: "LEGACY_FOR_SALES" },
+								},
+							],
+						},
+					}),
+					"campaigns"
+				);
+				if (!c.success.length) return textResult({ status: "FAILED at campaign — nothing created", errors: c.error });
+				const campaignId = c.success[0].campaignId;
+				created.campaignId = campaignId;
+
+				const g = adsWriteResult(
+					await adsRequest("POST", "/sp/adGroups", {
+						type: ADS_TYPE.adGroup,
+						body: { adGroups: [{ campaignId, name: campaign_name + " - exact", defaultBid: Number(default_bid), state: "ENABLED" }] },
+					}),
+					"adGroups"
+				);
+				if (!g.success.length) return textResult({ ...created, status: "FAILED at ad group — campaign exists, PAUSED", errors: g.error });
+				const adGroupId = g.success[0].adGroupId;
+				created.adGroupId = adGroupId;
+
+				const a = adsWriteResult(
+					await adsRequest("POST", "/sp/productAds", {
+						type: ADS_TYPE.productAd,
+						body: { productAds: [{ campaignId, adGroupId, sku: String(sku).trim(), state: "ENABLED" }] },
+					}),
+					"productAds"
+				);
+				created.product_ad = a.success.length ? { adId: a.success[0].adId, sku } : { errors: a.error };
+
+				const k = adsWriteResult(
+					await adsRequest("POST", "/sp/keywords", {
+						type: ADS_TYPE.keyword,
+						body: {
+							keywords: kws.map((x: any) => ({
+								campaignId,
+								adGroupId,
+								keywordText: x.text,
+								matchType: "EXACT",
+								bid: x.bid,
+								state: "ENABLED",
+							})),
+						},
+					}),
+					"keywords"
+				);
+				created.keywords_added = k.success.length;
+				if (k.error.length) created.keyword_errors = k.error;
+				created.next_step = "Check with ads_account_overview. Enable with ads_update_campaign (state ENABLED, confirm true) only when Adnan approves.";
+				return textResult(created);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_exact_keywords",
+		{
+			description:
+				"WRITE (guarded). Adds EXACT-match keywords to an existing ad group (e.g. harvested search terms). Each bid must be at or below the bid cap. Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				ad_group_id: z.string(),
+				keywords: z.array(z.object({ text: z.string(), bid: z.number() })).min(1).max(200),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ campaign_id, ad_group_id, keywords, confirm }: any) => {
+			try {
+				const { maxBid } = adsLimits();
+				const kws = keywords.map((k: any) => ({ text: cleanKeyword(k.text), bid: Number(k.bid) }));
+				const problems = checkNewKeywords(kws, maxBid);
+				const plan = kws.map((k: any) => ({ text: k.text, match: "EXACT", bid: money(k.bid) }));
+				if (problems.length) return textResult({ status: "REJECTED — nothing added", problems, plan });
+				if (!confirm) return textResult({ status: "PREVIEW — nothing added. Call again with confirm = true.", plan });
+
+				const r = adsWriteResult(
+					await adsRequest("POST", "/sp/keywords", {
+						type: ADS_TYPE.keyword,
+						body: {
+							keywords: kws.map((k: any) => ({
+								campaignId: String(campaign_id),
+								adGroupId: String(ad_group_id),
+								keywordText: k.text,
+								matchType: "EXACT",
+								bid: k.bid,
+								state: "ENABLED",
+							})),
+						},
+					}),
+					"keywords"
+				);
+				return textResult({ added: r.success.length, errors: r.error });
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_update_keywords",
+		{
+			description:
+				"WRITE (guarded). Lowers keyword bids and/or pauses or re-enables keywords. A bid can only go DOWN from its current value — increases are rejected. Keywords are never archived. Preview (with current vs new bid) unless confirm = true.",
+			inputSchema: z.object({
+				updates: z
+					.array(
+						z.object({
+							keyword_id: z.string(),
+							bid: z.number().optional().describe("New, LOWER bid."),
+							state: z.enum(["ENABLED", "PAUSED"]).optional(),
+						})
+					)
+					.min(1)
+					.max(200),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ updates, confirm }: any) => {
+			try {
+				const ids = updates.map((u: any) => String(u.keyword_id));
+				const current = await adsList("/sp/keywords/list", ADS_TYPE.keyword, "keywords", {
+					keywordIdFilter: { include: ids },
+				});
+				const byId = new Map(current.map((k: any) => [String(k.keywordId), k]));
+				const groups = await adsList("/sp/adGroups/list", ADS_TYPE.adGroup, "adGroups", {
+					adGroupIdFilter: { include: [...new Set(current.map((k: any) => String(k.adGroupId)))] },
+				});
+				const groupBid = new Map(groups.map((g: any) => [String(g.adGroupId), Number(g.defaultBid)]));
+
+				const problems: string[] = [];
+				const plan = updates.map((u: any) => {
+					const k: any = byId.get(String(u.keyword_id));
+					if (!k) {
+						problems.push("Keyword " + u.keyword_id + " not found.");
+						return { keyword_id: u.keyword_id };
+					}
+					const now = Number(k.bid ?? groupBid.get(String(k.adGroupId)));
+					if (u.bid !== undefined) {
+						if (!(u.bid >= 0.02)) problems.push('"' + k.keywordText + '" new bid below $0.02.');
+						if (u.bid > now) problems.push('"' + k.keywordText + '" bid $' + money(now) + " → $" + money(u.bid) + " is an INCREASE. Bids only go down.");
+					}
+					if (u.bid === undefined && !u.state) problems.push('"' + k.keywordText + '" has no change.');
+					return {
+						keyword_id: u.keyword_id,
+						text: k.keywordText,
+						bid: u.bid !== undefined ? money(now) + " → " + money(u.bid) : money(now) + " (unchanged)",
+						state: u.state ? k.state + " → " + u.state : k.state,
+					};
+				});
+				if (problems.length) return textResult({ status: "REJECTED — nothing changed", problems, plan });
+				if (!confirm) return textResult({ status: "PREVIEW — nothing changed. Call again with confirm = true.", plan });
+
+				const r = adsWriteResult(
+					await adsRequest("PUT", "/sp/keywords", {
+						type: ADS_TYPE.keyword,
+						body: {
+							keywords: updates.map((u: any) => {
+								const x: any = { keywordId: String(u.keyword_id) };
+								if (u.bid !== undefined) x.bid = Number(u.bid);
+								if (u.state) x.state = u.state;
+								return x;
+							}),
+						},
+					}),
+					"keywords"
+				);
+				return textResult({ updated: r.success.length, errors: r.error, plan });
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_negative_keywords",
+		{
+			description:
+				"WRITE (guarded). Adds negative keywords (NEGATIVE_EXACT by default, or NEGATIVE_PHRASE) to a campaign's ad group, to stop spend on search terms that don't convert. Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				ad_group_id: z.string(),
+				keywords: z.array(z.string()).min(1).max(200),
+				match_type: z.enum(["NEGATIVE_EXACT", "NEGATIVE_PHRASE"]).optional(),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ campaign_id, ad_group_id, keywords, match_type, confirm }: any) => {
+			try {
+				const match = match_type || "NEGATIVE_EXACT";
+				const kws = [...new Set(keywords.map(cleanKeyword).filter(Boolean))] as string[];
+				const plan = kws.map((t) => ({ text: t, match }));
+				if (!confirm) return textResult({ status: "PREVIEW — nothing added. Call again with confirm = true.", plan });
+
+				const r = adsWriteResult(
+					await adsRequest("POST", "/sp/negativeKeywords", {
+						type: ADS_TYPE.negativeKeyword,
+						body: {
+							negativeKeywords: kws.map((t) => ({
+								campaignId: String(campaign_id),
+								adGroupId: String(ad_group_id),
+								keywordText: t,
+								matchType: match,
+								state: "ENABLED",
+							})),
+						},
+					}),
+					"negativeKeywords"
+				);
+				return textResult({ added: r.success.length, errors: r.error });
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_update_campaign",
+		{
+			description:
+				"WRITE (guarded). Changes a campaign's daily budget (at or below the ceiling) and/or state (ENABLED starts spend, PAUSED stops it). Enabling a campaign spends money — only do it when Adnan has approved. Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				daily_budget: z.number().optional(),
+				state: z.enum(["ENABLED", "PAUSED"]).optional(),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ campaign_id, daily_budget, state, confirm }: any) => {
+			try {
+				const { maxDailyBudget } = adsLimits();
+				const [c] = await adsList("/sp/campaigns/list", ADS_TYPE.campaign, "campaigns", {
+					campaignIdFilter: { include: [String(campaign_id)] },
+				});
+				if (!c) return errorResult(new Error("Campaign " + campaign_id + " not found."));
+
+				const problems: string[] = [];
+				if (daily_budget === undefined && !state) problems.push("Nothing to change.");
+				if (daily_budget !== undefined && (!(daily_budget >= 1) || daily_budget > maxDailyBudget))
+					problems.push("daily_budget $" + money(Number(daily_budget)) + " must be $1.00–$" + money(maxDailyBudget) + ".");
+				if (state === "ENABLED" && c.targetingType !== "MANUAL") problems.push("This is an AUTO campaign; the rules allow exact-match manual campaigns only.");
+
+				const plan = {
+					campaign: c.name,
+					budget: daily_budget !== undefined ? money(Number(c.budget?.budget)) + " → " + money(daily_budget) : money(Number(c.budget?.budget)) + " (unchanged)",
+					state: state ? c.state + " → " + state : c.state,
+				};
+				if (problems.length) return textResult({ status: "REJECTED — nothing changed", problems, plan });
+				if (!confirm) return textResult({ status: "PREVIEW — nothing changed. Call again with confirm = true.", plan });
+
+				const x: any = { campaignId: String(campaign_id) };
+				if (daily_budget !== undefined) x.budget = { budgetType: "DAILY", budget: Number(daily_budget) };
+				if (state) x.state = state;
+				const r = adsWriteResult(
+					await adsRequest("PUT", "/sp/campaigns", { type: ADS_TYPE.campaign, body: { campaigns: [x] } }),
+					"campaigns"
+				);
+				return textResult({ updated: r.success.length, errors: r.error, plan });
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
 	return server;
 }
 
@@ -2360,6 +3288,13 @@ export default {
 		currentEnv = env;
 
 		const url = new URL(request.url);
+
+		// Amazon Ads sign-in lands here (registered as the LWA Allowed Return URL).
+		// It only swaps Amazon's one-time code for a token; it reveals nothing else.
+		if (url.pathname === ADS_CALLBACK_PATH && request.method === "GET") {
+			return handleAdsCallback(url);
+		}
+
 		const gate = env.ACCESS_KEY;
 
 		if (!gate || !url.pathname.startsWith("/" + gate)) {
