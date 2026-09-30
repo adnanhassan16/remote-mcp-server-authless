@@ -4122,7 +4122,7 @@ function createServer() {
 				"Change history: what changed on campaigns, ad groups, keywords and product ads (budgets, bids, states), when, and the before/after values. Use it to check what was changed by hand in the Ads console. Amazon keeps a limited window (roughly 90 days).",
 			inputSchema: z.object({
 				days: z.number().optional().describe("How far back. Default 30, max 89."),
-				max_events: z.number().optional().describe("Default 200."),
+				max_events: z.number().optional().describe("Default 200. Min 50, max 200."),
 			}),
 		},
 		async ({ days, max_events }: any) => {
@@ -4133,7 +4133,7 @@ function createServer() {
 						fromDate: Date.now() - d * 86400000,
 						toDate: Date.now(),
 						eventTypes: { CAMPAIGN: {}, AD_GROUP: {}, KEYWORD: {}, AD: {} },
-						count: Math.max(1, Math.min(max_events ?? 200, 200)),
+						count: Math.max(50, Math.min(max_events ?? 200, 200)), // Amazon allows 50–200
 						sort: { key: "DATE", direction: "DESC" },
 					},
 				});
