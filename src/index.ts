@@ -4004,12 +4004,15 @@ function createServer() {
 					const infos: any[] = k.bidInfo || [];
 					const exact = infos.find((b) => String(b.matchType).toUpperCase() === "EXACT") || infos[0] || k;
 					const sb = exact.suggestedBid || {};
-					const mid = bidOf(sb.rangeMedian ?? exact.bid ?? exact.suggestedBid);
+					// v4/v5 return bids in CENTS (111 = $1.11); v3 returns dollars.
+					const scale = /v[45]\+json/.test(type) ? 100 : 1;
+					const rawMid = bidOf(sb.rangeMedian ?? exact.bid ?? exact.suggestedBid);
+					const mid = rawMid == null ? null : rawMid / scale;
 					return {
 						keyword: k.keyword ?? k.keywordText,
 						rank: exact.rank ?? k.rank,
 						suggested_exact_bid: mid != null ? money(mid) : null,
-						range: sb.rangeStart != null ? money(Number(sb.rangeStart)) + "–" + money(Number(sb.rangeEnd)) : undefined,
+						range: sb.rangeStart != null ? money(Number(sb.rangeStart) / scale) + "–" + money(Number(sb.rangeEnd) / scale) : undefined,
 						vs_cap: mid == null ? null : mid <= maxBid ? "OK" : "ABOVE CAP",
 						impression_rank: k.searchTermImpressionRank,
 						impression_share: k.searchTermImpressionShare,
@@ -4049,6 +4052,7 @@ function createServer() {
 			const [sb, sd, portfolios] = await Promise.all([
 				section(async () => {
 					const items = await adsList("/sb/v4/campaigns/list", "application/vnd.sbcampaignresource.v4+json", "campaigns", {
+						maxResults: 100, // SB v4 allows 1–100 per page (SP allows 1000)
 						stateFilter: { include: states },
 					});
 					return items.map((c: any) => ({
@@ -4117,13 +4121,13 @@ function createServer() {
 			description:
 				"Change history: what changed on campaigns, ad groups, keywords and product ads (budgets, bids, states), when, and the before/after values. Use it to check what was changed by hand in the Ads console. Amazon keeps a limited window (roughly 90 days).",
 			inputSchema: z.object({
-				days: z.number().optional().describe("How far back. Default 30, max 90."),
+				days: z.number().optional().describe("How far back. Default 30, max 89."),
 				max_events: z.number().optional().describe("Default 200."),
 			}),
 		},
 		async ({ days, max_events }: any) => {
 			try {
-				const d = Math.max(1, Math.min(days ?? 30, 90));
+				const d = Math.max(1, Math.min(days ?? 30, 89)); // Amazon rejects exactly 90
 				const out = await adsRequest("POST", "/history", {
 					body: {
 						fromDate: Date.now() - d * 86400000,
