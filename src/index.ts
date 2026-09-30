@@ -659,6 +659,29 @@ async function collectEventsBySettlement(days: number) {
      7. Keywords are never archived (deleted), only paused.
    Reports flag any keyword or search term with 86+ clicks and fewer
    than 3 orders for pausing (Part 12).
+
+   ADS v2 — 30 September 2026 — "everything except DSP"
+     Reports: SP campaigns, daily, ad groups, placements, keywords,
+       search terms, advertised products, purchased products (halo);
+       Sponsored Brands campaigns + search terms; Sponsored Display
+       campaigns + targeting. Refused columns are dropped and retried.
+     Amazon's own suggested bids and suggested keywords.
+     SB / SD campaigns and portfolios — READ ONLY (rules: SP only).
+     Budget usage today; change history (~90 days).
+     Overview now also shows product/auto targets and campaign-level
+     and product negatives.
+     Not included: DSP (by request), Amazon Marketing Cloud (separate
+     paid instance), Marketing Stream (needs AWS queues).
+
+   ADS v3 — 30 September 2026 — full Sponsored Products control
+     New writes: ad groups (add, bid, state, name), product ads (add,
+     pause), product/ASIN targets and auto target groups, negative
+     product targets, campaign-level negatives, campaign name / end
+     date / bidding strategy / placement boosts, archive (permanent,
+     needs confirm_text ARCHIVE), SB/SD pause/enable/budget.
+     Money limits always on. Rule limits are SWITCHES Adnan sets as
+     Cloudflare variables: ADS_ALLOW_BID_INCREASE, ADS_ALLOWED_MATCH_TYPES,
+     ADS_ALLOW_AUTO, ADS_ALLOW_PRODUCT_TARGETING, ADS_MAX_PLACEMENT_PERCENT.
    ================================================================== */
 
 const ADS_HOST = "https://advertising-api.amazon.com";
@@ -673,18 +696,62 @@ const ADS_TYPE = {
 	negativeKeyword: "application/vnd.spNegativeKeyword.v3+json",
 	productAd: "application/vnd.spProductAd.v3+json",
 	report: "application/vnd.createasyncreportrequest.v3+json",
+	target: "application/vnd.spTargetingClause.v3+json",
+	campaignNegativeKeyword: "application/vnd.spCampaignNegativeKeyword.v3+json",
+	negativeTarget: "application/vnd.spNegativeTargetingClause.v3+json",
 };
 
 let adsToken: string | null = null;
 let adsTokenExpiry = 0;
 let adsProfileId: string | null = null;
 
+function envTrue(key: string): boolean {
+	return String(currentEnv?.[key] ?? "").trim().toLowerCase() === "true";
+}
+
+/**
+ * Money guardrails (always on) and rule SWITCHES (off unless Adnan sets them
+ * as Cloudflare variables). Every switch is his decision, made in Cloudflare,
+ * never by the chat.
+ *   ADS_MAX_BID                   bid cap, default 1.07
+ *   ADS_MAX_DAILY_BUDGET          budget ceiling per campaign, default 10
+ *   ADS_ALLOW_BID_INCREASE=true   allows raising bids (still under the cap)
+ *                                 and "up and down" dynamic bidding
+ *   ADS_ALLOWED_MATCH_TYPES       default EXACT; e.g. EXACT,PHRASE,BROAD
+ *   ADS_ALLOW_AUTO=true           allows AUTO campaigns
+ *   ADS_ALLOW_PRODUCT_TARGETING=true  allows ASIN / category targets
+ *   ADS_MAX_PLACEMENT_PERCENT     top-of-search / product-page boosts, default 0 (off), max 900
+ */
 function adsLimits() {
 	const bid = Number(currentEnv?.ADS_MAX_BID ?? 1.07);
 	const budget = Number(currentEnv?.ADS_MAX_DAILY_BUDGET ?? 10);
+	const placement = Number(currentEnv?.ADS_MAX_PLACEMENT_PERCENT ?? 0);
+	const match = String(currentEnv?.ADS_ALLOWED_MATCH_TYPES ?? "EXACT")
+		.split(",")
+		.map((s) => s.trim().toUpperCase())
+		.filter((s) => ["EXACT", "PHRASE", "BROAD"].includes(s));
 	return {
 		maxBid: Number.isFinite(bid) && bid > 0 ? bid : 1.07,
 		maxDailyBudget: Number.isFinite(budget) && budget > 0 ? budget : 10,
+		allowBidIncrease: envTrue("ADS_ALLOW_BID_INCREASE"),
+		allowedMatch: match.length ? match : ["EXACT"],
+		allowAuto: envTrue("ADS_ALLOW_AUTO"),
+		allowProductTargeting: envTrue("ADS_ALLOW_PRODUCT_TARGETING"),
+		maxPlacementPercent: Number.isFinite(placement) ? Math.max(0, Math.min(placement, 900)) : 0,
+	};
+}
+
+function switchesSummary() {
+	const l = adsLimits();
+	return {
+		bid_cap: money(l.maxBid),
+		max_daily_budget: money(l.maxDailyBudget),
+		bid_increases: l.allowBidIncrease ? "ALLOWED (under cap)" : "blocked — set ADS_ALLOW_BID_INCREASE=true to allow",
+		match_types: l.allowedMatch.join(", "),
+		auto_campaigns: l.allowAuto ? "ALLOWED" : "blocked — set ADS_ALLOW_AUTO=true to allow",
+		product_targeting: l.allowProductTargeting ? "ALLOWED" : "blocked — set ADS_ALLOW_PRODUCT_TARGETING=true to allow",
+		placement_boost_max: l.maxPlacementPercent ? l.maxPlacementPercent + "%" : "off — set ADS_MAX_PLACEMENT_PERCENT to allow",
+		writes: "preview unless confirm = true; archive also needs confirm_text ARCHIVE",
 	};
 }
 
@@ -831,57 +898,143 @@ function checkNewKeywords(keywords: { text: string; bid: number }[], maxBid: num
 	return problems;
 }
 
-/* ---------------- REPORTS (v3, asynchronous) ---------------- */
+/* ---------------- REPORTS (v3, asynchronous) — ADS v2 ----------------
+   Every report Amazon offers except DSP. Amazon keeps report data for a
+   limited window (Sponsored Products ≈ 95 days); older dates are refused.
+   If Amazon rejects a column, the Worker drops it and retries once.
+   -------------------------------------------------------------------- */
 
-const ADS_REPORTS: Record<string, { reportTypeId: string; groupBy: string[]; columns: string[] }> = {
+type AdsReportCfg = {
+	adProduct: "SPONSORED_PRODUCTS" | "SPONSORED_BRANDS" | "SPONSORED_DISPLAY";
+	reportTypeId: string;
+	groupBy: string[];
+	columns: string[];
+	timeUnit?: "SUMMARY" | "DAILY";
+	flags?: "keywords" | "search_terms";
+	note: string;
+};
+
+const SP_METRICS = ["impressions", "clicks", "cost", "purchases7d", "sales7d", "unitsSoldClicks7d"];
+const SB_METRICS = ["impressions", "clicks", "cost", "purchases", "sales", "unitsSold"];
+const SD_METRICS = ["impressions", "clicks", "cost", "purchases", "sales", "unitsSold"];
+
+const ADS_REPORTS: Record<string, AdsReportCfg> = {
+	/* ---- Sponsored Products ---- */
 	campaigns: {
-		reportTypeId: "spCampaigns",
-		groupBy: ["campaign"],
-		columns: [
-			"campaignName", "campaignId", "campaignStatus", "campaignBudgetAmount",
-			"impressions", "clicks", "cost", "purchases7d", "sales7d", "unitsSoldClicks7d",
-		],
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spCampaigns", groupBy: ["campaign"],
+		columns: ["campaignName", "campaignId", "campaignStatus", "campaignBudgetAmount", ...SP_METRICS],
+		note: "SP: one row per campaign.",
+	},
+	campaigns_daily: {
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spCampaigns", groupBy: ["campaign"], timeUnit: "DAILY",
+		columns: ["date", "campaignName", "campaignId", ...SP_METRICS],
+		note: "SP: one row per campaign per day — the trend.",
+	},
+	ad_groups: {
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spCampaigns", groupBy: ["campaign", "adGroup"],
+		columns: ["campaignName", "campaignId", "adGroupName", "adGroupId", ...SP_METRICS],
+		note: "SP: one row per ad group.",
+	},
+	placements: {
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spCampaigns", groupBy: ["campaign", "campaignPlacement"],
+		columns: ["campaignName", "campaignId", "placementClassification", ...SP_METRICS],
+		note: "SP: top of search vs rest of search vs product pages.",
 	},
 	keywords: {
-		reportTypeId: "spTargeting",
-		groupBy: ["targeting"],
-		columns: [
-			"campaignName", "campaignId", "adGroupName", "adGroupId", "keywordId", "keyword",
-			"matchType", "targeting", "impressions", "clicks", "cost", "purchases7d", "sales7d",
-			"unitsSoldClicks7d",
-		],
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spTargeting", groupBy: ["targeting"], flags: "keywords",
+		columns: ["campaignName", "campaignId", "adGroupName", "adGroupId", "keywordId", "keyword",
+			"matchType", "targeting", "keywordBid", ...SP_METRICS],
+		note: "SP: one row per keyword or product target.",
 	},
 	search_terms: {
-		reportTypeId: "spSearchTerm",
-		groupBy: ["searchTerm"],
-		columns: [
-			"campaignName", "campaignId", "adGroupName", "adGroupId", "keywordId", "keyword",
-			"matchType", "searchTerm", "impressions", "clicks", "cost", "purchases7d", "sales7d",
-			"unitsSoldClicks7d",
-		],
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spSearchTerm", groupBy: ["searchTerm"], flags: "search_terms",
+		columns: ["campaignName", "campaignId", "adGroupName", "adGroupId", "keywordId", "keyword",
+			"matchType", "searchTerm", ...SP_METRICS],
+		note: "SP: what shoppers actually typed.",
+	},
+	advertised_products: {
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spAdvertisedProduct", groupBy: ["advertiser"],
+		columns: ["campaignName", "campaignId", "adGroupName", "adGroupId", "advertisedAsin", "advertisedSku",
+			...SP_METRICS],
+		note: "SP: results per advertised ASIN/SKU.",
+	},
+	purchased_products: {
+		adProduct: "SPONSORED_PRODUCTS", reportTypeId: "spPurchasedProduct", groupBy: ["asin"],
+		columns: ["campaignName", "campaignId", "adGroupName", "adGroupId", "keyword", "matchType",
+			"advertisedAsin", "advertisedSku", "purchasedAsin",
+			"purchasesOtherSku7d", "salesOtherSku7d", "unitsSoldOtherSku7d"],
+		note: "SP: other ASINs shoppers bought after clicking your ad (halo sales).",
+	},
+	/* ---- Sponsored Brands (read only — your rules do not run these) ---- */
+	sb_campaigns: {
+		adProduct: "SPONSORED_BRANDS", reportTypeId: "sbCampaigns", groupBy: ["campaign"],
+		columns: ["campaignName", "campaignId", "campaignStatus", "campaignBudgetAmount", ...SB_METRICS],
+		note: "SB (headline/video): one row per campaign. 14-day attribution.",
+	},
+	sb_search_terms: {
+		adProduct: "SPONSORED_BRANDS", reportTypeId: "sbSearchTerm", groupBy: ["searchTerm"], flags: "search_terms",
+		columns: ["campaignName", "campaignId", "adGroupName", "adGroupId", "keywordText", "matchType",
+			"searchTerm", ...SB_METRICS],
+		note: "SB: what shoppers typed. 14-day attribution.",
+	},
+	/* ---- Sponsored Display (read only) ---- */
+	sd_campaigns: {
+		adProduct: "SPONSORED_DISPLAY", reportTypeId: "sdCampaigns", groupBy: ["campaign"],
+		columns: ["campaignName", "campaignId", "campaignStatus", "campaignBudgetAmount", ...SD_METRICS],
+		note: "SD: one row per campaign. 14-day attribution.",
+	},
+	sd_targeting: {
+		adProduct: "SPONSORED_DISPLAY", reportTypeId: "sdTargeting", groupBy: ["targeting"],
+		columns: ["campaignName", "campaignId", "adGroupName", "adGroupId", "targetingText", "targetingExpression",
+			...SD_METRICS],
+		note: "SD: one row per audience or product target.",
 	},
 };
 
-async function adsCreateReport(kind: string, startDate: string, endDate: string) {
+const ADS_REPORT_KINDS = Object.keys(ADS_REPORTS) as [string, ...string[]];
+
+function reportBody(kind: string, startDate: string, endDate: string, columns: string[]) {
 	const cfg = ADS_REPORTS[kind];
-	return adsRequest("POST", "/reporting/reports", {
-		type: ADS_TYPE.report,
-		body: {
-			name: "AH Inside " + kind + " " + startDate + " to " + endDate,
-			startDate,
-			endDate,
-			configuration: {
-				adProduct: "SPONSORED_PRODUCTS",
-				groupBy: cfg.groupBy,
-				columns: cfg.columns,
-				reportTypeId: cfg.reportTypeId,
-				timeUnit: "SUMMARY",
-				format: "GZIP_JSON",
-			},
+	return {
+		name: "AH Inside " + kind + " " + startDate + " to " + endDate,
+		startDate,
+		endDate,
+		configuration: {
+			adProduct: cfg.adProduct,
+			groupBy: cfg.groupBy,
+			columns,
+			reportTypeId: cfg.reportTypeId,
+			timeUnit: cfg.timeUnit || "SUMMARY",
+			format: "GZIP_JSON",
 		},
-	});
+	};
 }
 
+/** Creates a report. If Amazon names columns it does not accept, drops them and retries once. */
+async function adsCreateReport(kind: string, startDate: string, endDate: string) {
+	const cfg = ADS_REPORTS[kind];
+	if (!cfg) throw new Error("Unknown report kind: " + kind);
+	let columns = [...cfg.columns];
+	try {
+		const out = await adsRequest("POST", "/reporting/reports", { type: ADS_TYPE.report, body: reportBody(kind, startDate, endDate, columns) });
+		return { ...out, dropped_columns: [] as string[] };
+	} catch (e: any) {
+		const msg = String(e?.message || e);
+		if (!/column/i.test(msg)) throw e;
+		const allowedMatch = msg.match(/allowed values?[^\[]*\[([^\]]+)\]/i);
+		let dropped: string[];
+		if (allowedMatch) {
+			const allowed = new Set(allowedMatch[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")));
+			dropped = columns.filter((c) => !allowed.has(c));
+		} else {
+			dropped = columns.filter((c) => new RegExp("\\b" + c + "\\b").test(msg));
+		}
+		if (!dropped.length) throw e;
+		columns = columns.filter((c) => !dropped.includes(c));
+		const out = await adsRequest("POST", "/reporting/reports", { type: ADS_TYPE.report, body: reportBody(kind, startDate, endDate, columns) });
+		return { ...out, dropped_columns: dropped };
+	}
+}
 
 /** Polls a report; downloads and summarises it once COMPLETED. */
 async function adsFetchReport(reportId: string, kind: string, waitSeconds: number) {
@@ -899,7 +1052,7 @@ async function adsFetchReport(reportId: string, kind: string, waitSeconds: numbe
 		return {
 			report_id: reportId,
 			status: info.status,
-			next_step: "Amazon is still building it. Call ads_get_report with this report_id in a few minutes.",
+			next_step: "Amazon is still building it. Call ads_get_report with this report_id and kind in a few minutes.",
 		};
 	}
 
@@ -910,43 +1063,56 @@ async function adsFetchReport(reportId: string, kind: string, waitSeconds: numbe
 	return { report_id: reportId, status: "COMPLETED", ...summariseAdsRows(rows, kind) };
 }
 
+/** Reads sales/orders whatever the ad product calls them. */
+function rowSales(r: any): number {
+	return Number(r.sales7d ?? r.sales14d ?? r.sales ?? r.salesClicks ?? r.salesOtherSku7d ?? 0);
+}
+function rowOrders(r: any): number {
+	return Number(r.purchases7d ?? r.purchases14d ?? r.purchases ?? r.purchasesClicks ?? r.purchasesOtherSku7d ?? 0);
+}
+
 function summariseAdsRows(rows: any[], kind: string) {
 	const { maxBid } = adsLimits();
+	const cfg = ADS_REPORTS[kind];
 	let clicks = 0, cost = 0, sales = 0, orders = 0, impressions = 0;
 
 	const out = rows.map((r) => {
 		const c = Number(r.clicks || 0);
 		const spend = Number(r.cost || 0);
-		const s = Number(r.sales7d || 0);
-		const o = Number(r.purchases7d || 0);
+		const s = rowSales(r);
+		const o = rowOrders(r);
 		clicks += c; cost += spend; sales += s; orders += o; impressions += Number(r.impressions || 0);
 
-		const row: any = {
-			...r,
-			cpc: c ? money(spend / c) : null,
-			acos: s ? pct(spend / s) : spend ? "no sales" : null,
-			cvr: c ? pct(o / c) : null,
-		};
-		if (kind !== "campaigns") {
+		const row: any = { ...r };
+		if ("clicks" in r || "cost" in r) {
+			row.cpc = c ? money(spend / c) : null;
+			row.acos = s ? pct(spend / s) : spend ? "no sales" : null;
+			row.cvr = c ? pct(o / c) : null;
+		}
+		if (cfg?.flags) {
 			if (c >= PAUSE_MIN_CLICKS && o < PAUSE_MAX_ORDERS) row.flag = "PAUSE: " + c + " clicks, " + o + " orders";
-			if (kind === "search_terms" && c >= 10 && o === 0 && !row.flag) row.flag = "WATCH: negative candidate";
-			if (kind === "search_terms" && o >= 2 && String(r.matchType || "").toUpperCase() !== "EXACT")
+			if (cfg.flags === "search_terms" && c >= 10 && o === 0 && !row.flag) row.flag = "WATCH: negative candidate";
+			if (cfg.flags === "search_terms" && o >= 2 && String(r.matchType || "").toUpperCase() !== "EXACT")
 				row.flag = "HARVEST: add as exact keyword";
+			if (cfg.flags === "keywords" && Number(r.keywordBid) > maxBid && !row.flag)
+				row.flag = "OVER CAP: bid $" + money(Number(r.keywordBid)) + " > $" + money(maxBid);
 		}
 		return row;
 	});
 
-	out.sort((a, b) => Number(b.cost || 0) - Number(a.cost || 0));
+	if (cfg?.timeUnit === "DAILY") out.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+	else out.sort((a, b) => Number(b.cost || 0) - Number(a.cost || 0) || rowSales(b) - rowSales(a));
 
 	return {
 		kind,
+		about: cfg?.note,
 		rows: out.length,
 		totals: {
 			impressions,
 			clicks,
 			spend: money(cost),
-			sales_7d: money(sales),
-			orders_7d: orders,
+			sales: money(sales),
+			orders,
 			acos: sales ? pct(cost / sales) : null,
 			cpc: clicks ? money(cost / clicks) : null,
 			cvr: clicks ? pct(orders / clicks) : null,
@@ -954,11 +1120,34 @@ function summariseAdsRows(rows: any[], kind: string) {
 		rules: {
 			bid_cap: money(maxBid),
 			pause_rule: PAUSE_MIN_CLICKS + " clicks with fewer than " + PAUSE_MAX_ORDERS + " orders",
-			attribution: "Orders and sales are Amazon's 7-day click attribution.",
+			attribution: cfg?.adProduct === "SPONSORED_PRODUCTS" ? "7-day click attribution" : "14-day attribution",
 		},
 		flagged: out.filter((r) => r.flag).slice(0, 100),
 		data: out.slice(0, 300),
 	};
+}
+
+/* ---------------- RECOMMENDATIONS (Amazon's own numbers) ---------------- */
+
+/** Tries newer media-type versions first; falls back when Amazon says the version is unsupported. */
+async function adsPostVersioned(path: string, types: string[], body: any): Promise<{ out: any; type: string }> {
+	let lastErr: any = null;
+	for (const t of types) {
+		try {
+			return { out: await adsRequest("POST", path, { type: t, body }), type: t };
+		} catch (e: any) {
+			lastErr = e;
+			if (!/ 415| 406|media type|content.?type|accept/i.test(String(e?.message || e))) throw e;
+		}
+	}
+	throw lastErr;
+}
+
+function bidOf(x: any): number | null {
+	if (x == null) return null;
+	if (typeof x === "number") return x;
+	const v = x.suggestedBid ?? x.bid ?? x.value ?? x.rangeMedian;
+	return v == null ? null : Number(v);
 }
 
 /* ---------------- AUTHORIZATION CALLBACK PAGE ---------------- */
@@ -1078,7 +1267,7 @@ async function handleAdsCallback(url: URL): Promise<Response> {
 function createServer() {
 	const server = new McpServer({
 		name: "AH Inside Seller Central",
-		version: "6.0.0",
+		version: "6.2.0",
 	});
 
 	/* ============ BRAND ANALYTICS — TOP SEARCH TERMS ============ */
@@ -2814,14 +3003,7 @@ function createServer() {
 						type: p.accountInfo?.type,
 						name: p.accountInfo?.name,
 					})),
-					guardrails: {
-						bid_cap: money(maxBid),
-						max_daily_budget: money(maxDailyBudget),
-						match_types_allowed: "EXACT only (negatives: exact or phrase)",
-						bid_changes: "down only on existing keywords",
-						new_campaigns: "created PAUSED, dynamic bids down only",
-						writes: "preview unless confirm = true",
-					},
+					guardrails: switchesSummary(),
 				});
 			} catch (e) {
 				return errorResult(e);
@@ -2833,7 +3015,7 @@ function createServer() {
 		"ads_account_overview",
 		{
 			description:
-				"Amazon Ads: every Sponsored Products campaign (state, daily budget, bidding strategy), its ad groups (default bid), advertised SKUs, keywords (text, match type, bid, state) and negative keywords. Archived items are hidden. Optionally limit to one campaign_id. Use it before any change, and to see current bids.",
+				"Amazon Ads: every Sponsored Products campaign (state, daily budget, bidding strategy), its ad groups (default bid), advertised SKUs, keywords (text, match type, bid, state), product/auto targets, and negative keywords and targets (ad-group and campaign level). Archived items are hidden. Optionally limit to one campaign_id. Use it before any change, and to see current bids.",
 			inputSchema: z.object({
 				campaign_id: z.string().optional().describe("Only this campaign."),
 			}),
@@ -2851,10 +3033,22 @@ function createServer() {
 						...byCampaign,
 					}),
 				]);
+				const optional = async (p: Promise<any[]>) => {
+					try {
+						return await p;
+					} catch {
+						return [] as any[];
+					}
+				};
+				const [targets, campaignNegatives, negativeTargets] = await Promise.all([
+					optional(adsList("/sp/targets/list", ADS_TYPE.target, "targetingClauses", { stateFilter: LIVE_STATES, ...byCampaign })),
+					optional(adsList("/sp/campaignNegativeKeywords/list", ADS_TYPE.campaignNegativeKeyword, "campaignNegativeKeywords", { stateFilter: LIVE_STATES, ...byCampaign })),
+					optional(adsList("/sp/negativeTargets/list", ADS_TYPE.negativeTarget, "negativeTargetingClauses", { stateFilter: LIVE_STATES, ...byCampaign })),
+				]);
 				const { maxBid, maxDailyBudget } = adsLimits();
 
 				return textResult({
-					guardrails: { bid_cap: money(maxBid), max_daily_budget: money(maxDailyBudget) },
+					guardrails: switchesSummary(),
 					campaigns: campaigns.map((c) => ({
 						campaignId: c.campaignId,
 						name: c.name,
@@ -2883,17 +3077,35 @@ function createServer() {
 										state: k.state,
 										over_cap: Number(k.bid ?? g.defaultBid) > maxBid ? "YES — lower it" : undefined,
 									})),
+								product_and_auto_targets: targets
+									.filter((t) => t.adGroupId === g.adGroupId)
+									.map((t) => ({
+										targetId: t.targetId,
+										expression: (t.expression || []).map((x: any) => x.type + (x.value ? ": " + x.value : "")).join(" + "),
+										bid: t.bid ?? g.defaultBid,
+										state: t.state,
+									})),
 							})),
 						negatives: negatives
 							.filter((n) => n.campaignId === c.campaignId)
-							.map((n) => ({ keywordId: n.keywordId, text: n.keywordText, match: n.matchType, adGroupId: n.adGroupId })),
+							.map((n) => ({ keywordId: n.keywordId, text: n.keywordText, match: n.matchType, adGroupId: n.adGroupId }))
+							.concat(
+								campaignNegatives
+									.filter((n) => n.campaignId === c.campaignId)
+									.map((n) => ({ keywordId: n.keywordId, text: n.keywordText, match: n.matchType, adGroupId: "campaign level" }))
+							),
+						negative_product_targets: negativeTargets
+							.filter((n) => n.campaignId === c.campaignId)
+							.map((n) => ({ targetId: n.targetId, expression: (n.expression || []).map((x: any) => x.type + ": " + x.value).join(" + ") })),
 						not_exact_only: c.targetingType !== "MANUAL" ? "AUTO campaign — breaks the exact-only rule" : undefined,
 					})),
 					counts: {
 						campaigns: campaigns.length,
 						ad_groups: adGroups.length,
 						keywords: keywords.length,
-						negatives: negatives.length,
+						negatives: negatives.length + campaignNegatives.length,
+						product_and_auto_targets: targets.length,
+						negative_product_targets: negativeTargets.length,
 					},
 				});
 			} catch (e) {
@@ -2906,9 +3118,9 @@ function createServer() {
 		"ads_request_report",
 		{
 			description:
-				"Amazon Ads performance report (Sponsored Products, 7-day attribution). kind = campaigns | keywords | search_terms. Returns spend, clicks, orders, sales, ACOS, CPC and CVR per row with totals, and FLAGS rows to act on: PAUSE (86+ clicks, <3 orders), WATCH (10+ clicks, 0 orders — negative candidate), HARVEST (search term with 2+ orders not yet an exact keyword). Amazon builds reports asynchronously: if it is not ready within wait_seconds you get a report_id — call ads_get_report with it later. Max 31 days per report; data is kept about 60–95 days.",
+				"Amazon Ads performance report — every report type except DSP. Sponsored Products: campaigns | campaigns_daily | ad_groups | placements (top of search vs rest) | keywords | search_terms | advertised_products | purchased_products (halo sales of other ASINs). Sponsored Brands: sb_campaigns | sb_search_terms. Sponsored Display: sd_campaigns | sd_targeting. Returns spend, clicks, orders, sales, ACOS, CPC and CVR per row with totals, and FLAGS rows to act on: PAUSE (86+ clicks, <3 orders), WATCH (10+ clicks, 0 orders — negative candidate), HARVEST (search term with 2+ orders not yet an exact keyword). Amazon builds reports asynchronously: if it is not ready within wait_seconds you get a report_id — call ads_get_report with it later. Max 31 days per report. Amazon keeps only about 95 days of report data (older dates are refused), so save monthly reports.",
 			inputSchema: z.object({
-				kind: z.enum(["campaigns", "keywords", "search_terms"]),
+				kind: z.enum(ADS_REPORT_KINDS),
 				start_date: z.string().optional().describe("YYYY-MM-DD. Default 30 days ago."),
 				end_date: z.string().optional().describe("YYYY-MM-DD. Default yesterday."),
 				wait_seconds: z.number().optional().describe("Default 60, max 100."),
@@ -2924,7 +3136,13 @@ function createServer() {
 
 				const created = await adsCreateReport(kind, start, end);
 				const wait = Math.max(5, Math.min(wait_seconds ?? 60, 100));
-				return textResult({ start_date: start, end_date: end, ...(await adsFetchReport(created.reportId, kind, wait)) });
+				const result = await adsFetchReport(created.reportId, kind, wait);
+				return textResult({
+					start_date: start,
+					end_date: end,
+					...(created.dropped_columns?.length ? { columns_amazon_refused: created.dropped_columns } : {}),
+					...result,
+				});
 			} catch (e: any) {
 				const m = String(e?.message || e);
 				const dup = m.match(/duplicate of\s*:?\s*([0-9a-f-]{36})/i);
@@ -2932,6 +3150,13 @@ function createServer() {
 					return textResult({
 						note: "Amazon already has this exact report. Use ads_get_report with this id.",
 						report_id: dup[1],
+					});
+				}
+				const ret = m.match(/retention start date \(?(\d{4}-\d{2}-\d{2})/i);
+				if (ret) {
+					return textResult({
+						status: "REFUSED — too old",
+						note: "Amazon only keeps this report type from " + ret[1] + ". Use a start_date on or after that date. Older history exists only in manual exports from the Ads console.",
 					});
 				}
 				return errorResult(e);
@@ -2946,7 +3171,7 @@ function createServer() {
 				"Fetch an Amazon Ads report started earlier by ads_request_report. Pass the report_id and the same kind.",
 			inputSchema: z.object({
 				report_id: z.string(),
-				kind: z.enum(["campaigns", "keywords", "search_terms"]),
+				kind: z.enum(ADS_REPORT_KINDS),
 				wait_seconds: z.number().optional().describe("Default 30, max 100."),
 			}),
 		},
@@ -2960,270 +3185,179 @@ function createServer() {
 		}
 	);
 
+	/* ================================================================
+	   WRITE TOOLS — ADS v3 (Sponsored Products full control)
+	   Every write: preview unless confirm = true. Money limits always on;
+	   rule limits are switches in Cloudflare (see adsLimits()).
+	   ================================================================ */
+
+	const matchSchema = z.enum(["EXACT", "PHRASE", "BROAD"]).optional();
+	const placementSchema = z
+		.object({
+			top_of_search: z.number().optional(),
+			product_pages: z.number().optional(),
+			rest_of_search: z.number().optional(),
+		})
+		.optional()
+		.describe("Placement bid boosts in percent (0 = none). Blocked unless ADS_MAX_PLACEMENT_PERCENT is set.");
+
+	const checkMatch = (m: string, problems: string[]) => {
+		const { allowedMatch } = adsLimits();
+		if (!allowedMatch.includes(m)) problems.push("Match type " + m + " is blocked (allowed: " + allowedMatch.join(", ") + "; switch ADS_ALLOWED_MATCH_TYPES).");
+	};
+	const checkBudget = (b: number | undefined, problems: string[]) => {
+		const { maxDailyBudget } = adsLimits();
+		if (b !== undefined && (!(b >= 1) || b > maxDailyBudget))
+			problems.push("daily_budget $" + money(Number(b)) + " must be $1.00–$" + money(maxDailyBudget) + " (ADS_MAX_DAILY_BUDGET).");
+	};
+	const checkBid = (label: string, bid: number | undefined, current: number | undefined, problems: string[]) => {
+		if (bid === undefined) return;
+		const { maxBid, allowBidIncrease } = adsLimits();
+		if (!(bid >= 0.02)) problems.push(label + " bid $" + money(Number(bid)) + " is below Amazon's $0.02 minimum.");
+		if (bid > maxBid) problems.push(label + " bid $" + money(bid) + " is above the $" + money(maxBid) + " cap (ADS_MAX_BID).");
+		if (current !== undefined && Number.isFinite(current) && bid > current && !allowBidIncrease)
+			problems.push(label + " $" + money(current) + " → $" + money(bid) + " is an INCREASE (blocked; switch ADS_ALLOW_BID_INCREASE).");
+	};
+	const placementBidding = (p: any, problems: string[]) => {
+		if (!p) return undefined;
+		const { maxPlacementPercent } = adsLimits();
+		const rows = [
+			["PLACEMENT_TOP", p.top_of_search],
+			["PLACEMENT_PRODUCT_PAGE", p.product_pages],
+			["PLACEMENT_REST_OF_SEARCH", p.rest_of_search],
+		].filter(([, v]) => v !== undefined) as [string, number][];
+		for (const [k, v] of rows) {
+			if (!(v >= 0) || v > maxPlacementPercent)
+				problems.push(k + " " + v + "% must be 0–" + maxPlacementPercent + "% (ADS_MAX_PLACEMENT_PERCENT).");
+		}
+		return rows.map(([placement, percentage]) => ({ placement, percentage: Math.round(percentage) }));
+	};
+	const strategyOk = (s: string | undefined, problems: string[]) => {
+		if (!s) return;
+		const { allowBidIncrease } = adsLimits();
+		if (s !== "LEGACY_FOR_SALES" && !allowBidIncrease)
+			problems.push("Bidding " + s + " can raise bids (blocked; only LEGACY_FOR_SALES = down only, unless ADS_ALLOW_BID_INCREASE).");
+	};
+	const previewOrRun = async (confirm: boolean | undefined, problems: string[], plan: any, run: () => Promise<any>) => {
+		if (problems.length) return textResult({ status: "REJECTED — nothing changed", problems, plan, switches: switchesSummary() });
+		if (!confirm) return textResult({ status: "PREVIEW — nothing changed. Call again with confirm = true.", plan });
+		return textResult({ status: "DONE", plan, result: await run() });
+	};
+	const currentKeywords = async (ids: string[]) => {
+		const kws = await adsList("/sp/keywords/list", ADS_TYPE.keyword, "keywords", { keywordIdFilter: { include: ids } });
+		const groups = kws.length
+			? await adsList("/sp/adGroups/list", ADS_TYPE.adGroup, "adGroups", {
+					adGroupIdFilter: { include: [...new Set(kws.map((k: any) => String(k.adGroupId)))] },
+				})
+			: [];
+		const gBid = new Map(groups.map((g: any) => [String(g.adGroupId), Number(g.defaultBid)]));
+		return new Map(kws.map((k: any) => [String(k.keywordId), { ...k, effectiveBid: Number(k.bid ?? gBid.get(String(k.adGroupId))) }]));
+	};
+
+	server.registerTool(
+		"ads_switches",
+		{
+			description: "Shows the rule switches and money limits currently in force for all Ads write tools, and how to change each one in Cloudflare.",
+			inputSchema: z.object({}),
+		},
+		async () => textResult(switchesSummary())
+	);
+
 	server.registerTool(
 		"ads_create_exact_campaign",
 		{
 			description:
-				"WRITE (guarded). Builds one Sponsored Products launch campaign in a single step: MANUAL campaign (created PAUSED, dynamic bids 'down only'), one ad group, the SKU as the product ad, and EXACT-match keywords. Rejects any bid above the bid cap and any budget above the daily ceiling. Without confirm = true it only returns a preview. The campaign stays PAUSED until ads_update_campaign sets it ENABLED — turning ads on is Adnan's decision.",
+				"WRITE. Builds a Sponsored Products campaign in one step: campaign (created PAUSED), one ad group, the SKU(s) as product ads, and keywords (EXACT by default; other match types only if switched on). Optional AUTO campaign (switch ADS_ALLOW_AUTO), bidding strategy (default 'down only') and placement boosts (switch). Bids ≤ cap, budget ≤ ceiling. Preview unless confirm = true. Turning it on is a separate ads_update_campaign call — Adnan's decision.",
 			inputSchema: z.object({
 				campaign_name: z.string(),
-				sku: z.string().describe("Seller SKU of the product to advertise."),
+				sku: z.string().describe("Seller SKU to advertise."),
+				extra_skus: z.array(z.string()).optional(),
 				daily_budget: z.number(),
-				default_bid: z.number().describe("Ad group default bid; must be at or below the bid cap."),
-				keywords: z
-					.array(z.object({ text: z.string(), bid: z.number().optional() }))
-					.min(1)
-					.max(200)
-					.describe("Exact keywords. A keyword without a bid uses default_bid."),
-				confirm: z.boolean().optional().describe("true = create it. Omit to preview."),
+				default_bid: z.number(),
+				targeting: z.enum(["MANUAL", "AUTO"]).optional().describe("Default MANUAL."),
+				match_type: matchSchema.describe("For all keywords. Default EXACT."),
+				keywords: z.array(z.object({ text: z.string(), bid: z.number().optional() })).max(200).optional(),
+				bidding_strategy: z.enum(["LEGACY_FOR_SALES", "AUTO_FOR_SALES", "MANUAL"]).optional(),
+				placements: placementSchema,
+				end_date: z.string().optional().describe("YYYY-MM-DD"),
+				confirm: z.boolean().optional(),
 			}),
 		},
-		async ({ campaign_name, sku, daily_budget, default_bid, keywords, confirm }: any) => {
+		async (a: any) => {
 			try {
-				const { maxBid, maxDailyBudget } = adsLimits();
-				const kws = keywords.map((k: any) => ({ text: cleanKeyword(k.text), bid: Number(k.bid ?? default_bid) }));
-				const problems = checkNewKeywords(kws, maxBid);
-				if (!(default_bid > 0) || default_bid > maxBid)
-					problems.push("default_bid $" + money(Number(default_bid)) + " must be above 0 and at or below the $" + money(maxBid) + " cap.");
-				if (!(daily_budget >= 1) || daily_budget > maxDailyBudget)
-					problems.push("daily_budget $" + money(Number(daily_budget)) + " must be $1.00–$" + money(maxDailyBudget) + ".");
-				if (!String(sku || "").trim()) problems.push("sku is required.");
+				const { allowAuto } = adsLimits();
+				const problems: string[] = [];
+				const targeting = a.targeting || "MANUAL";
+				const match = a.match_type || "EXACT";
+				const strategy = a.bidding_strategy || "LEGACY_FOR_SALES";
+				if (targeting === "AUTO" && !allowAuto) problems.push("AUTO campaigns are blocked (switch ADS_ALLOW_AUTO).");
+				if (targeting === "MANUAL" && !(a.keywords?.length)) problems.push("A MANUAL campaign needs keywords.");
+				checkBudget(a.daily_budget, problems);
+				checkBid("default", a.default_bid, undefined, problems);
+				strategyOk(strategy, problems);
+				const kws = (a.keywords || []).map((k: any) => ({ text: cleanKeyword(k.text), bid: Number(k.bid ?? a.default_bid) }));
+				if (kws.length) {
+					checkMatch(match, problems);
+					problems.push(...checkNewKeywords(kws, adsLimits().maxBid));
+				}
+				const pb = placementBidding(a.placements, problems);
+				const skus = [a.sku, ...(a.extra_skus || [])].map((s: string) => String(s).trim()).filter(Boolean);
 
 				const plan = {
-					campaign: { name: campaign_name, targeting: "MANUAL", state: "PAUSED", daily_budget: money(daily_budget), bidding: "Dynamic bids - down only" },
-					ad_group: { name: campaign_name + " - exact", default_bid: money(default_bid) },
-					product_ad: { sku },
-					keywords: kws.map((k: any) => ({ text: k.text, match: "EXACT", bid: money(k.bid) })),
-					max_spend_per_day: money(daily_budget),
+					campaign: { name: a.campaign_name, targeting, state: "PAUSED", daily_budget: money(a.daily_budget), bidding: strategy, placements: pb, end_date: a.end_date },
+					ad_group: { name: a.campaign_name + " - " + (targeting === "AUTO" ? "auto" : match.toLowerCase()), default_bid: money(a.default_bid) },
+					skus,
+					keywords: kws.map((k: any) => ({ text: k.text, match, bid: money(k.bid) })),
 				};
-				if (problems.length) return textResult({ status: "REJECTED — nothing created", problems, plan });
-				if (!confirm) return textResult({ status: "PREVIEW — nothing created. Call again with confirm = true.", plan });
-
-				const created: any = { status: "CREATED (PAUSED — no spend until enabled)" };
-
-				const c = adsWriteResult(
-					await adsRequest("POST", "/sp/campaigns", {
-						type: ADS_TYPE.campaign,
-						body: {
-							campaigns: [
-								{
-									name: campaign_name,
-									targetingType: "MANUAL",
-									state: "PAUSED",
-									startDate: todayISODate(),
-									budget: { budgetType: "DAILY", budget: Number(daily_budget) },
-									dynamicBidding: { strategy: "LEGACY_FOR_SALES" },
-								},
-							],
-						},
-					}),
-					"campaigns"
-				);
-				if (!c.success.length) return textResult({ status: "FAILED at campaign — nothing created", errors: c.error });
-				const campaignId = c.success[0].campaignId;
-				created.campaignId = campaignId;
-
-				const g = adsWriteResult(
-					await adsRequest("POST", "/sp/adGroups", {
-						type: ADS_TYPE.adGroup,
-						body: { adGroups: [{ campaignId, name: campaign_name + " - exact", defaultBid: Number(default_bid), state: "ENABLED" }] },
-					}),
-					"adGroups"
-				);
-				if (!g.success.length) return textResult({ ...created, status: "FAILED at ad group — campaign exists, PAUSED", errors: g.error });
-				const adGroupId = g.success[0].adGroupId;
-				created.adGroupId = adGroupId;
-
-				const a = adsWriteResult(
-					await adsRequest("POST", "/sp/productAds", {
-						type: ADS_TYPE.productAd,
-						body: { productAds: [{ campaignId, adGroupId, sku: String(sku).trim(), state: "ENABLED" }] },
-					}),
-					"productAds"
-				);
-				created.product_ad = a.success.length ? { adId: a.success[0].adId, sku } : { errors: a.error };
-
-				const k = adsWriteResult(
-					await adsRequest("POST", "/sp/keywords", {
-						type: ADS_TYPE.keyword,
-						body: {
-							keywords: kws.map((x: any) => ({
-								campaignId,
-								adGroupId,
-								keywordText: x.text,
-								matchType: "EXACT",
-								bid: x.bid,
-								state: "ENABLED",
-							})),
-						},
-					}),
-					"keywords"
-				);
-				created.keywords_added = k.success.length;
-				if (k.error.length) created.keyword_errors = k.error;
-				created.next_step = "Check with ads_account_overview. Enable with ads_update_campaign (state ENABLED, confirm true) only when Adnan approves.";
-				return textResult(created);
-			} catch (e) {
-				return errorResult(e);
-			}
-		}
-	);
-
-	server.registerTool(
-		"ads_add_exact_keywords",
-		{
-			description:
-				"WRITE (guarded). Adds EXACT-match keywords to an existing ad group (e.g. harvested search terms). Each bid must be at or below the bid cap. Preview unless confirm = true.",
-			inputSchema: z.object({
-				campaign_id: z.string(),
-				ad_group_id: z.string(),
-				keywords: z.array(z.object({ text: z.string(), bid: z.number() })).min(1).max(200),
-				confirm: z.boolean().optional(),
-			}),
-		},
-		async ({ campaign_id, ad_group_id, keywords, confirm }: any) => {
-			try {
-				const { maxBid } = adsLimits();
-				const kws = keywords.map((k: any) => ({ text: cleanKeyword(k.text), bid: Number(k.bid) }));
-				const problems = checkNewKeywords(kws, maxBid);
-				const plan = kws.map((k: any) => ({ text: k.text, match: "EXACT", bid: money(k.bid) }));
-				if (problems.length) return textResult({ status: "REJECTED — nothing added", problems, plan });
-				if (!confirm) return textResult({ status: "PREVIEW — nothing added. Call again with confirm = true.", plan });
-
-				const r = adsWriteResult(
-					await adsRequest("POST", "/sp/keywords", {
-						type: ADS_TYPE.keyword,
-						body: {
-							keywords: kws.map((k: any) => ({
-								campaignId: String(campaign_id),
-								adGroupId: String(ad_group_id),
-								keywordText: k.text,
-								matchType: "EXACT",
-								bid: k.bid,
-								state: "ENABLED",
-							})),
-						},
-					}),
-					"keywords"
-				);
-				return textResult({ added: r.success.length, errors: r.error });
-			} catch (e) {
-				return errorResult(e);
-			}
-		}
-	);
-
-	server.registerTool(
-		"ads_update_keywords",
-		{
-			description:
-				"WRITE (guarded). Lowers keyword bids and/or pauses or re-enables keywords. A bid can only go DOWN from its current value — increases are rejected. Keywords are never archived. Preview (with current vs new bid) unless confirm = true.",
-			inputSchema: z.object({
-				updates: z
-					.array(
-						z.object({
-							keyword_id: z.string(),
-							bid: z.number().optional().describe("New, LOWER bid."),
-							state: z.enum(["ENABLED", "PAUSED"]).optional(),
-						})
-					)
-					.min(1)
-					.max(200),
-				confirm: z.boolean().optional(),
-			}),
-		},
-		async ({ updates, confirm }: any) => {
-			try {
-				const ids = updates.map((u: any) => String(u.keyword_id));
-				const current = await adsList("/sp/keywords/list", ADS_TYPE.keyword, "keywords", {
-					keywordIdFilter: { include: ids },
-				});
-				const byId = new Map(current.map((k: any) => [String(k.keywordId), k]));
-				const groups = await adsList("/sp/adGroups/list", ADS_TYPE.adGroup, "adGroups", {
-					adGroupIdFilter: { include: [...new Set(current.map((k: any) => String(k.adGroupId)))] },
-				});
-				const groupBid = new Map(groups.map((g: any) => [String(g.adGroupId), Number(g.defaultBid)]));
-
-				const problems: string[] = [];
-				const plan = updates.map((u: any) => {
-					const k: any = byId.get(String(u.keyword_id));
-					if (!k) {
-						problems.push("Keyword " + u.keyword_id + " not found.");
-						return { keyword_id: u.keyword_id };
+				return await previewOrRun(a.confirm, problems, plan, async () => {
+					const camp: any = {
+						name: a.campaign_name,
+						targetingType: targeting,
+						state: "PAUSED",
+						startDate: todayISODate(),
+						budget: { budgetType: "DAILY", budget: Number(a.daily_budget) },
+						dynamicBidding: { strategy, ...(pb?.length ? { placementBidding: pb } : {}) },
+					};
+					if (a.end_date) camp.endDate = a.end_date;
+					const c = adsWriteResult(await adsRequest("POST", "/sp/campaigns", { type: ADS_TYPE.campaign, body: { campaigns: [camp] } }), "campaigns");
+					if (!c.success.length) return { failed_at: "campaign", errors: c.error };
+					const campaignId = c.success[0].campaignId;
+					const g = adsWriteResult(
+						await adsRequest("POST", "/sp/adGroups", {
+							type: ADS_TYPE.adGroup,
+							body: { adGroups: [{ campaignId, name: plan.ad_group.name, defaultBid: Number(a.default_bid), state: "ENABLED" }] },
+						}),
+						"adGroups"
+					);
+					if (!g.success.length) return { campaignId, failed_at: "ad group (campaign exists, PAUSED)", errors: g.error };
+					const adGroupId = g.success[0].adGroupId;
+					const ads = adsWriteResult(
+						await adsRequest("POST", "/sp/productAds", {
+							type: ADS_TYPE.productAd,
+							body: { productAds: skus.map((sku) => ({ campaignId, adGroupId, sku, state: "ENABLED" })) },
+						}),
+						"productAds"
+					);
+					let kw: any = { success: [], error: [] };
+					if (kws.length) {
+						kw = adsWriteResult(
+							await adsRequest("POST", "/sp/keywords", {
+								type: ADS_TYPE.keyword,
+								body: { keywords: kws.map((k: any) => ({ campaignId, adGroupId, keywordText: k.text, matchType: match, bid: k.bid, state: "ENABLED" })) },
+							}),
+							"keywords"
+						);
 					}
-					const now = Number(k.bid ?? groupBid.get(String(k.adGroupId)));
-					if (u.bid !== undefined) {
-						if (!(u.bid >= 0.02)) problems.push('"' + k.keywordText + '" new bid below $0.02.');
-						if (u.bid > now) problems.push('"' + k.keywordText + '" bid $' + money(now) + " → $" + money(u.bid) + " is an INCREASE. Bids only go down.");
-					}
-					if (u.bid === undefined && !u.state) problems.push('"' + k.keywordText + '" has no change.');
 					return {
-						keyword_id: u.keyword_id,
-						text: k.keywordText,
-						bid: u.bid !== undefined ? money(now) + " → " + money(u.bid) : money(now) + " (unchanged)",
-						state: u.state ? k.state + " → " + u.state : k.state,
+						campaignId,
+						adGroupId,
+						state: "PAUSED — no spend until enabled",
+						product_ads_added: ads.success.length,
+						product_ad_errors: ads.error.length ? ads.error : undefined,
+						keywords_added: kw.success.length,
+						keyword_errors: kw.error.length ? kw.error : undefined,
 					};
 				});
-				if (problems.length) return textResult({ status: "REJECTED — nothing changed", problems, plan });
-				if (!confirm) return textResult({ status: "PREVIEW — nothing changed. Call again with confirm = true.", plan });
-
-				const r = adsWriteResult(
-					await adsRequest("PUT", "/sp/keywords", {
-						type: ADS_TYPE.keyword,
-						body: {
-							keywords: updates.map((u: any) => {
-								const x: any = { keywordId: String(u.keyword_id) };
-								if (u.bid !== undefined) x.bid = Number(u.bid);
-								if (u.state) x.state = u.state;
-								return x;
-							}),
-						},
-					}),
-					"keywords"
-				);
-				return textResult({ updated: r.success.length, errors: r.error, plan });
-			} catch (e) {
-				return errorResult(e);
-			}
-		}
-	);
-
-	server.registerTool(
-		"ads_add_negative_keywords",
-		{
-			description:
-				"WRITE (guarded). Adds negative keywords (NEGATIVE_EXACT by default, or NEGATIVE_PHRASE) to a campaign's ad group, to stop spend on search terms that don't convert. Preview unless confirm = true.",
-			inputSchema: z.object({
-				campaign_id: z.string(),
-				ad_group_id: z.string(),
-				keywords: z.array(z.string()).min(1).max(200),
-				match_type: z.enum(["NEGATIVE_EXACT", "NEGATIVE_PHRASE"]).optional(),
-				confirm: z.boolean().optional(),
-			}),
-		},
-		async ({ campaign_id, ad_group_id, keywords, match_type, confirm }: any) => {
-			try {
-				const match = match_type || "NEGATIVE_EXACT";
-				const kws = [...new Set(keywords.map(cleanKeyword).filter(Boolean))] as string[];
-				const plan = kws.map((t) => ({ text: t, match }));
-				if (!confirm) return textResult({ status: "PREVIEW — nothing added. Call again with confirm = true.", plan });
-
-				const r = adsWriteResult(
-					await adsRequest("POST", "/sp/negativeKeywords", {
-						type: ADS_TYPE.negativeKeyword,
-						body: {
-							negativeKeywords: kws.map((t) => ({
-								campaignId: String(campaign_id),
-								adGroupId: String(ad_group_id),
-								keywordText: t,
-								matchType: match,
-								state: "ENABLED",
-							})),
-						},
-					}),
-					"negativeKeywords"
-				);
-				return textResult({ added: r.success.length, errors: r.error });
 			} catch (e) {
 				return errorResult(e);
 			}
@@ -3234,44 +3368,786 @@ function createServer() {
 		"ads_update_campaign",
 		{
 			description:
-				"WRITE (guarded). Changes a campaign's daily budget (at or below the ceiling) and/or state (ENABLED starts spend, PAUSED stops it). Enabling a campaign spends money — only do it when Adnan has approved. Preview unless confirm = true.",
+				"WRITE. Changes a Sponsored Products campaign: state (ENABLED starts spend, PAUSED stops it), daily budget (≤ ceiling), name, end date, bidding strategy ('down only' unless switch) and placement boosts (switch). Enabling spends money — only when Adnan approves. Preview unless confirm = true.",
 			inputSchema: z.object({
 				campaign_id: z.string(),
-				daily_budget: z.number().optional(),
 				state: z.enum(["ENABLED", "PAUSED"]).optional(),
+				daily_budget: z.number().optional(),
+				name: z.string().optional(),
+				end_date: z.string().optional().describe("YYYY-MM-DD, or 'none' to remove."),
+				bidding_strategy: z.enum(["LEGACY_FOR_SALES", "AUTO_FOR_SALES", "MANUAL"]).optional(),
+				placements: placementSchema,
 				confirm: z.boolean().optional(),
 			}),
 		},
-		async ({ campaign_id, daily_budget, state, confirm }: any) => {
+		async (a: any) => {
 			try {
-				const { maxDailyBudget } = adsLimits();
-				const [c] = await adsList("/sp/campaigns/list", ADS_TYPE.campaign, "campaigns", {
-					campaignIdFilter: { include: [String(campaign_id)] },
-				});
-				if (!c) return errorResult(new Error("Campaign " + campaign_id + " not found."));
-
+				const { allowAuto } = adsLimits();
+				const [c] = await adsList("/sp/campaigns/list", ADS_TYPE.campaign, "campaigns", { campaignIdFilter: { include: [String(a.campaign_id)] } });
+				if (!c) return errorResult(new Error("Campaign " + a.campaign_id + " not found."));
 				const problems: string[] = [];
-				if (daily_budget === undefined && !state) problems.push("Nothing to change.");
-				if (daily_budget !== undefined && (!(daily_budget >= 1) || daily_budget > maxDailyBudget))
-					problems.push("daily_budget $" + money(Number(daily_budget)) + " must be $1.00–$" + money(maxDailyBudget) + ".");
-				if (state === "ENABLED" && c.targetingType !== "MANUAL") problems.push("This is an AUTO campaign; the rules allow exact-match manual campaigns only.");
+				checkBudget(a.daily_budget, problems);
+				strategyOk(a.bidding_strategy, problems);
+				const pb = placementBidding(a.placements, problems);
+				if (a.state === "ENABLED" && c.targetingType === "AUTO" && !allowAuto) problems.push("This is an AUTO campaign (blocked; switch ADS_ALLOW_AUTO).");
+				if (a.state === "ENABLED" && c.dynamicBidding?.strategy && c.dynamicBidding.strategy !== "LEGACY_FOR_SALES" && !a.bidding_strategy)
+					strategyOk(c.dynamicBidding.strategy, problems);
+				if (a.state === "ENABLED" && Number(c.budget?.budget) > adsLimits().maxDailyBudget && a.daily_budget === undefined)
+					problems.push("Current budget $" + money(Number(c.budget?.budget)) + " is above the ceiling — set daily_budget in the same call.");
+				const changes = ["state", "daily_budget", "name", "end_date", "bidding_strategy", "placements"].filter((k) => a[k] !== undefined);
+				if (!changes.length) problems.push("Nothing to change.");
 
-				const plan = {
-					campaign: c.name,
-					budget: daily_budget !== undefined ? money(Number(c.budget?.budget)) + " → " + money(daily_budget) : money(Number(c.budget?.budget)) + " (unchanged)",
-					state: state ? c.state + " → " + state : c.state,
-				};
-				if (problems.length) return textResult({ status: "REJECTED — nothing changed", problems, plan });
-				if (!confirm) return textResult({ status: "PREVIEW — nothing changed. Call again with confirm = true.", plan });
+				const plan: any = { campaign: c.name, changes: {} };
+				if (a.state) plan.changes.state = c.state + " → " + a.state;
+				if (a.daily_budget !== undefined) plan.changes.budget = money(Number(c.budget?.budget)) + " → " + money(a.daily_budget);
+				if (a.name) plan.changes.name = c.name + " → " + a.name;
+				if (a.end_date) plan.changes.end_date = (c.endDate || "none") + " → " + a.end_date;
+				if (a.bidding_strategy) plan.changes.bidding = (c.dynamicBidding?.strategy || "?") + " → " + a.bidding_strategy;
+				if (pb) plan.changes.placements = pb;
 
-				const x: any = { campaignId: String(campaign_id) };
-				if (daily_budget !== undefined) x.budget = { budgetType: "DAILY", budget: Number(daily_budget) };
-				if (state) x.state = state;
-				const r = adsWriteResult(
-					await adsRequest("PUT", "/sp/campaigns", { type: ADS_TYPE.campaign, body: { campaigns: [x] } }),
-					"campaigns"
+				return await previewOrRun(a.confirm, problems, plan, async () => {
+					const x: any = { campaignId: String(a.campaign_id) };
+					if (a.state) x.state = a.state;
+					if (a.daily_budget !== undefined) x.budget = { budgetType: "DAILY", budget: Number(a.daily_budget) };
+					if (a.name) x.name = a.name;
+					if (a.end_date) x.endDate = a.end_date === "none" ? null : a.end_date;
+					if (a.bidding_strategy || pb) {
+						x.dynamicBidding = {
+							strategy: a.bidding_strategy || c.dynamicBidding?.strategy || "LEGACY_FOR_SALES",
+							placementBidding: pb ?? c.dynamicBidding?.placementBidding ?? [],
+						};
+					}
+					return adsWriteResult(await adsRequest("PUT", "/sp/campaigns", { type: ADS_TYPE.campaign, body: { campaigns: [x] } }), "campaigns");
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_update_ad_group",
+		{
+			description:
+				"WRITE. Changes an ad group's default bid (≤ cap; increases need the switch), state (ENABLED/PAUSED) or name. Preview unless confirm = true.",
+			inputSchema: z.object({
+				ad_group_id: z.string(),
+				default_bid: z.number().optional(),
+				state: z.enum(["ENABLED", "PAUSED"]).optional(),
+				name: z.string().optional(),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async (a: any) => {
+			try {
+				const [g] = await adsList("/sp/adGroups/list", ADS_TYPE.adGroup, "adGroups", { adGroupIdFilter: { include: [String(a.ad_group_id)] } });
+				if (!g) return errorResult(new Error("Ad group " + a.ad_group_id + " not found."));
+				const problems: string[] = [];
+				checkBid("default", a.default_bid, Number(g.defaultBid), problems);
+				if (a.default_bid === undefined && !a.state && !a.name) problems.push("Nothing to change.");
+				const plan: any = { ad_group: g.name, changes: {} };
+				if (a.default_bid !== undefined) plan.changes.default_bid = money(Number(g.defaultBid)) + " → " + money(a.default_bid);
+				if (a.state) plan.changes.state = g.state + " → " + a.state;
+				if (a.name) plan.changes.name = g.name + " → " + a.name;
+				return await previewOrRun(a.confirm, problems, plan, async () => {
+					const x: any = { adGroupId: String(a.ad_group_id) };
+					if (a.default_bid !== undefined) x.defaultBid = Number(a.default_bid);
+					if (a.state) x.state = a.state;
+					if (a.name) x.name = a.name;
+					return adsWriteResult(await adsRequest("PUT", "/sp/adGroups", { type: ADS_TYPE.adGroup, body: { adGroups: [x] } }), "adGroups");
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_ad_group",
+		{
+			description:
+				"WRITE. Adds a new ad group (with SKUs and keywords) inside an existing campaign — e.g. a separate group for a second keyword set. Same checks as campaign creation. Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				name: z.string(),
+				default_bid: z.number(),
+				skus: z.array(z.string()).min(1),
+				match_type: matchSchema,
+				keywords: z.array(z.object({ text: z.string(), bid: z.number().optional() })).max(200).optional(),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async (a: any) => {
+			try {
+				const problems: string[] = [];
+				const match = a.match_type || "EXACT";
+				checkBid("default", a.default_bid, undefined, problems);
+				const kws = (a.keywords || []).map((k: any) => ({ text: cleanKeyword(k.text), bid: Number(k.bid ?? a.default_bid) }));
+				if (kws.length) {
+					checkMatch(match, problems);
+					problems.push(...checkNewKeywords(kws, adsLimits().maxBid));
+				}
+				const plan = { campaign_id: a.campaign_id, ad_group: a.name, default_bid: money(a.default_bid), skus: a.skus, keywords: kws.map((k: any) => ({ text: k.text, match, bid: money(k.bid) })) };
+				return await previewOrRun(a.confirm, problems, plan, async () => {
+					const campaignId = String(a.campaign_id);
+					const g = adsWriteResult(
+						await adsRequest("POST", "/sp/adGroups", { type: ADS_TYPE.adGroup, body: { adGroups: [{ campaignId, name: a.name, defaultBid: Number(a.default_bid), state: "ENABLED" }] } }),
+						"adGroups"
+					);
+					if (!g.success.length) return { failed_at: "ad group", errors: g.error };
+					const adGroupId = g.success[0].adGroupId;
+					const ads = adsWriteResult(
+						await adsRequest("POST", "/sp/productAds", { type: ADS_TYPE.productAd, body: { productAds: a.skus.map((sku: string) => ({ campaignId, adGroupId, sku: String(sku).trim(), state: "ENABLED" })) } }),
+						"productAds"
+					);
+					let kw: any = { success: [], error: [] };
+					if (kws.length)
+						kw = adsWriteResult(
+							await adsRequest("POST", "/sp/keywords", { type: ADS_TYPE.keyword, body: { keywords: kws.map((k: any) => ({ campaignId, adGroupId, keywordText: k.text, matchType: match, bid: k.bid, state: "ENABLED" })) } }),
+							"keywords"
+						);
+					return { adGroupId, product_ads_added: ads.success.length, product_ad_errors: ads.error, keywords_added: kw.success.length, keyword_errors: kw.error };
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_exact_keywords",
+		{
+			description:
+				"WRITE. Adds keywords to an existing ad group (e.g. harvested search terms). EXACT by default; PHRASE/BROAD only if switched on. Each bid ≤ cap. Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				ad_group_id: z.string(),
+				keywords: z.array(z.object({ text: z.string(), bid: z.number() })).min(1).max(200),
+				match_type: matchSchema,
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async (a: any) => {
+			try {
+				const match = a.match_type || "EXACT";
+				const kws = a.keywords.map((k: any) => ({ text: cleanKeyword(k.text), bid: Number(k.bid) }));
+				const problems = checkNewKeywords(kws, adsLimits().maxBid);
+				checkMatch(match, problems);
+				const plan = kws.map((k: any) => ({ text: k.text, match, bid: money(k.bid) }));
+				return await previewOrRun(a.confirm, problems, plan, async () =>
+					adsWriteResult(
+						await adsRequest("POST", "/sp/keywords", {
+							type: ADS_TYPE.keyword,
+							body: { keywords: kws.map((k: any) => ({ campaignId: String(a.campaign_id), adGroupId: String(a.ad_group_id), keywordText: k.text, matchType: match, bid: k.bid, state: "ENABLED" })) },
+						}),
+						"keywords"
+					)
 				);
-				return textResult({ updated: r.success.length, errors: r.error, plan });
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_update_keywords",
+		{
+			description:
+				"WRITE. Changes keyword bids and/or state (ENABLED/PAUSED). Bids only go DOWN unless ADS_ALLOW_BID_INCREASE is on, and never above the cap. Preview shows current → new. To delete, use ads_archive.",
+			inputSchema: z.object({
+				updates: z.array(z.object({ keyword_id: z.string(), bid: z.number().optional(), state: z.enum(["ENABLED", "PAUSED"]).optional() })).min(1).max(200),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ updates, confirm }: any) => {
+			try {
+				const cur = await currentKeywords(updates.map((u: any) => String(u.keyword_id)));
+				const problems: string[] = [];
+				const plan = updates.map((u: any) => {
+					const k: any = cur.get(String(u.keyword_id));
+					if (!k) {
+						problems.push("Keyword " + u.keyword_id + " not found.");
+						return { keyword_id: u.keyword_id };
+					}
+					checkBid('"' + k.keywordText + '"', u.bid, k.effectiveBid, problems);
+					if (u.bid === undefined && !u.state) problems.push('"' + k.keywordText + '" has no change.');
+					return {
+						keyword_id: u.keyword_id,
+						text: k.keywordText,
+						match: k.matchType,
+						bid: u.bid !== undefined ? money(k.effectiveBid) + " → " + money(u.bid) : money(k.effectiveBid) + " (unchanged)",
+						state: u.state ? k.state + " → " + u.state : k.state,
+					};
+				});
+				return await previewOrRun(confirm, problems, plan, async () =>
+					adsWriteResult(
+						await adsRequest("PUT", "/sp/keywords", {
+							type: ADS_TYPE.keyword,
+							body: {
+								keywords: updates.map((u: any) => {
+									const x: any = { keywordId: String(u.keyword_id) };
+									if (u.bid !== undefined) x.bid = Number(u.bid);
+									if (u.state) x.state = u.state;
+									return x;
+								}),
+							},
+						}),
+						"keywords"
+					)
+				);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_negative_keywords",
+		{
+			description:
+				"WRITE. Adds negative keywords (NEGATIVE_EXACT default, or NEGATIVE_PHRASE). Give ad_group_id for ad-group level, or leave it out for campaign level (blocks the term in every ad group). Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				ad_group_id: z.string().optional(),
+				keywords: z.array(z.string()).min(1).max(200),
+				match_type: z.enum(["NEGATIVE_EXACT", "NEGATIVE_PHRASE"]).optional(),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ campaign_id, ad_group_id, keywords, match_type, confirm }: any) => {
+			try {
+				const match = match_type || "NEGATIVE_EXACT";
+				const kws = [...new Set(keywords.map(cleanKeyword).filter(Boolean))] as string[];
+				const level = ad_group_id ? "ad group " + ad_group_id : "campaign level";
+				const plan = kws.map((t) => ({ text: t, match, level }));
+				return await previewOrRun(confirm, [], plan, async () => {
+					if (ad_group_id) {
+						return adsWriteResult(
+							await adsRequest("POST", "/sp/negativeKeywords", {
+								type: ADS_TYPE.negativeKeyword,
+								body: { negativeKeywords: kws.map((t) => ({ campaignId: String(campaign_id), adGroupId: String(ad_group_id), keywordText: t, matchType: match, state: "ENABLED" })) },
+							}),
+							"negativeKeywords"
+						);
+					}
+					return adsWriteResult(
+						await adsRequest("POST", "/sp/campaignNegativeKeywords", {
+							type: ADS_TYPE.campaignNegativeKeyword,
+							body: { campaignNegativeKeywords: kws.map((t) => ({ campaignId: String(campaign_id), keywordText: t, matchType: match, state: "ENABLED" })) },
+						}),
+						"campaignNegativeKeywords"
+					);
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_product_targets",
+		{
+			description:
+				"WRITE. Targets competitor product pages (ASIN) or a category in a MANUAL ad group. Blocked unless ADS_ALLOW_PRODUCT_TARGETING=true. Each bid ≤ cap. Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				ad_group_id: z.string(),
+				targets: z
+					.array(z.object({ asin: z.string().optional(), category_id: z.string().optional(), bid: z.number() }))
+					.min(1)
+					.max(100),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ campaign_id, ad_group_id, targets, confirm }: any) => {
+			try {
+				const { allowProductTargeting } = adsLimits();
+				const problems: string[] = [];
+				if (!allowProductTargeting) problems.push("Product targeting is blocked (switch ADS_ALLOW_PRODUCT_TARGETING).");
+				const clauses = targets.map((t: any) => {
+					if (!t.asin && !t.category_id) problems.push("Each target needs asin or category_id.");
+					checkBid(t.asin || t.category_id, t.bid, undefined, problems);
+					return {
+						campaignId: String(campaign_id),
+						adGroupId: String(ad_group_id),
+						expressionType: "MANUAL",
+						expression: [t.asin ? { type: "ASIN_SAME_AS", value: String(t.asin).trim().toUpperCase() } : { type: "ASIN_CATEGORY_SAME_AS", value: String(t.category_id) }],
+						bid: Number(t.bid),
+						state: "ENABLED",
+					};
+				});
+				const plan = clauses.map((c: any) => ({ target: c.expression[0].type + ": " + c.expression[0].value, bid: money(c.bid) }));
+				return await previewOrRun(confirm, problems, plan, async () =>
+					adsWriteResult(await adsRequest("POST", "/sp/targets", { type: ADS_TYPE.target, body: { targetingClauses: clauses } }), "targetingClauses")
+				);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_update_targets",
+		{
+			description:
+				"WRITE. Changes bids or state of product targets and AUTO-campaign target groups (close match, loose match, substitutes, complements). Same bid rules as keywords. Preview unless confirm = true.",
+			inputSchema: z.object({
+				updates: z.array(z.object({ target_id: z.string(), bid: z.number().optional(), state: z.enum(["ENABLED", "PAUSED"]).optional() })).min(1).max(100),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ updates, confirm }: any) => {
+			try {
+				const cur = await adsList("/sp/targets/list", ADS_TYPE.target, "targetingClauses", { targetIdFilter: { include: updates.map((u: any) => String(u.target_id)) } });
+				const byId = new Map(cur.map((t: any) => [String(t.targetId), t]));
+				const problems: string[] = [];
+				const plan = updates.map((u: any) => {
+					const t: any = byId.get(String(u.target_id));
+					if (!t) {
+						problems.push("Target " + u.target_id + " not found.");
+						return { target_id: u.target_id };
+					}
+					const label = (t.expression || []).map((x: any) => x.type + (x.value ? ": " + x.value : "")).join(" + ");
+					checkBid(label, u.bid, t.bid !== undefined ? Number(t.bid) : undefined, problems);
+					return { target_id: u.target_id, target: label, bid: u.bid !== undefined ? (t.bid ?? "default") + " → " + money(u.bid) : "unchanged", state: u.state ? t.state + " → " + u.state : t.state };
+				});
+				return await previewOrRun(confirm, problems, plan, async () =>
+					adsWriteResult(
+						await adsRequest("PUT", "/sp/targets", {
+							type: ADS_TYPE.target,
+							body: {
+								targetingClauses: updates.map((u: any) => {
+									const x: any = { targetId: String(u.target_id) };
+									if (u.bid !== undefined) x.bid = Number(u.bid);
+									if (u.state) x.state = u.state;
+									return x;
+								}),
+							},
+						}),
+						"targetingClauses"
+					)
+				);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_negative_product_targets",
+		{
+			description:
+				"WRITE. Stops ads showing on specific product pages (negative ASIN targets) — e.g. your own listings or pages that waste clicks. Preview unless confirm = true.",
+			inputSchema: z.object({
+				campaign_id: z.string(),
+				ad_group_id: z.string(),
+				asins: z.array(z.string()).min(1).max(100),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ campaign_id, ad_group_id, asins, confirm }: any) => {
+			try {
+				const list = [...new Set(asins.map((x: string) => String(x).trim().toUpperCase()))] as string[];
+				return await previewOrRun(confirm, [], list.map((x) => ({ negative_asin: x })), async () =>
+					adsWriteResult(
+						await adsRequest("POST", "/sp/negativeTargets", {
+							type: ADS_TYPE.negativeTarget,
+							body: { negativeTargetingClauses: list.map((x) => ({ campaignId: String(campaign_id), adGroupId: String(ad_group_id), expression: [{ type: "ASIN_SAME_AS", value: x }], state: "ENABLED" })) },
+						}),
+						"negativeTargetingClauses"
+					)
+				);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_add_product_ads",
+		{
+			description: "WRITE. Adds SKUs to an existing ad group. Preview unless confirm = true.",
+			inputSchema: z.object({ campaign_id: z.string(), ad_group_id: z.string(), skus: z.array(z.string()).min(1).max(50), confirm: z.boolean().optional() }),
+		},
+		async ({ campaign_id, ad_group_id, skus, confirm }: any) => {
+			try {
+				const list = skus.map((s: string) => String(s).trim()).filter(Boolean);
+				return await previewOrRun(confirm, [], { ad_group_id, skus: list }, async () =>
+					adsWriteResult(
+						await adsRequest("POST", "/sp/productAds", {
+							type: ADS_TYPE.productAd,
+							body: { productAds: list.map((sku: string) => ({ campaignId: String(campaign_id), adGroupId: String(ad_group_id), sku, state: "ENABLED" })) },
+						}),
+						"productAds"
+					)
+				);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_update_product_ads",
+		{
+			description: "WRITE. Pauses or re-enables advertised SKUs (product ads) by ad_id. Preview unless confirm = true.",
+			inputSchema: z.object({
+				updates: z.array(z.object({ ad_id: z.string(), state: z.enum(["ENABLED", "PAUSED"]) })).min(1).max(100),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ updates, confirm }: any) => {
+			try {
+				return await previewOrRun(confirm, [], updates, async () =>
+					adsWriteResult(
+						await adsRequest("PUT", "/sp/productAds", {
+							type: ADS_TYPE.productAd,
+							body: { productAds: updates.map((u: any) => ({ adId: String(u.ad_id), state: u.state })) },
+						}),
+						"productAds"
+					)
+				);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	const ARCHIVE_MAP: Record<string, { path: string; type: string; filter: string; key: string }> = {
+		campaign: { path: "/sp/campaigns/delete", type: ADS_TYPE.campaign, filter: "campaignIdFilter", key: "campaigns" },
+		ad_group: { path: "/sp/adGroups/delete", type: ADS_TYPE.adGroup, filter: "adGroupIdFilter", key: "adGroups" },
+		keyword: { path: "/sp/keywords/delete", type: ADS_TYPE.keyword, filter: "keywordIdFilter", key: "keywords" },
+		negative_keyword: { path: "/sp/negativeKeywords/delete", type: ADS_TYPE.negativeKeyword, filter: "negativeKeywordIdFilter", key: "negativeKeywords" },
+		campaign_negative_keyword: { path: "/sp/campaignNegativeKeywords/delete", type: ADS_TYPE.campaignNegativeKeyword, filter: "campaignNegativeKeywordIdFilter", key: "campaignNegativeKeywords" },
+		product_ad: { path: "/sp/productAds/delete", type: ADS_TYPE.productAd, filter: "adIdFilter", key: "productAds" },
+		target: { path: "/sp/targets/delete", type: ADS_TYPE.target, filter: "targetIdFilter", key: "targetingClauses" },
+		negative_target: { path: "/sp/negativeTargets/delete", type: ADS_TYPE.negativeTarget, filter: "negativeTargetIdFilter", key: "negativeTargetingClauses" },
+	};
+
+	server.registerTool(
+		"ads_archive",
+		{
+			description:
+				"WRITE — PERMANENT. Archives (deletes) Sponsored Products items: campaign, ad_group, keyword, negative_keyword, campaign_negative_keyword, product_ad, target, negative_target. Archived items cannot be restored; their history stays in reports. Needs confirm = true AND confirm_text = 'ARCHIVE'. Removing a negative keyword is done here (entity negative_keyword).",
+			inputSchema: z.object({
+				entity: z.enum(["campaign", "ad_group", "keyword", "negative_keyword", "campaign_negative_keyword", "product_ad", "target", "negative_target"]),
+				ids: z.array(z.string()).min(1).max(100),
+				confirm: z.boolean().optional(),
+				confirm_text: z.string().optional(),
+			}),
+		},
+		async ({ entity, ids, confirm, confirm_text }: any) => {
+			try {
+				const m = ARCHIVE_MAP[entity];
+				const plan = { archive: entity, ids, warning: "Permanent — cannot be undone." };
+				if (!confirm || confirm_text !== "ARCHIVE")
+					return textResult({ status: "PREVIEW — nothing archived. Call again with confirm = true and confirm_text = 'ARCHIVE'.", plan });
+				const out = await adsRequest("POST", m.path, { type: m.type, body: { [m.filter]: { include: ids.map(String) } } });
+				return textResult({ status: "DONE", plan, result: adsWriteResult(out, m.key) });
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_update_other_campaign",
+		{
+			description:
+				"WRITE. Pauses or re-enables a Sponsored Brands or Sponsored Display campaign, or changes its budget (≤ ceiling). Creating SB/SD campaigns needs creatives and stays in the Ads console. Preview unless confirm = true.",
+			inputSchema: z.object({
+				ad_type: z.enum(["SPONSORED_BRANDS", "SPONSORED_DISPLAY"]),
+				campaign_id: z.string(),
+				state: z.enum(["ENABLED", "PAUSED"]).optional(),
+				budget: z.number().optional(),
+				confirm: z.boolean().optional(),
+			}),
+		},
+		async ({ ad_type, campaign_id, state, budget, confirm }: any) => {
+			try {
+				const problems: string[] = [];
+				checkBudget(budget, problems);
+				if (!state && budget === undefined) problems.push("Nothing to change.");
+				const plan = { ad_type, campaign_id, state, budget: budget !== undefined ? money(budget) : undefined };
+				return await previewOrRun(confirm, problems, plan, async () => {
+					if (ad_type === "SPONSORED_BRANDS") {
+						const x: any = { campaignId: String(campaign_id) };
+						if (state) x.state = state;
+						if (budget !== undefined) x.budget = Number(budget);
+						return adsRequest("PUT", "/sb/v4/campaigns", { type: "application/vnd.sbcampaignresource.v4+json", body: { campaigns: [x] } });
+					}
+					const x: any = { campaignId: Number(campaign_id) };
+					if (state) x.state = state.toLowerCase();
+					if (budget !== undefined) x.budget = Number(budget);
+					return adsRequest("PUT", "/sd/campaigns", { body: [x] });
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	/* ================================================================
+	   ADS v2 — Amazon's own recommendations, other ad types (read only),
+	   budget usage and change history. DSP deliberately left out.
+	   ================================================================ */
+
+	server.registerTool(
+		"ads_bid_recommendations",
+		{
+			description:
+				"Amazon's OWN suggested bids (low / suggested / high) for exact-match keywords — first-party CPC data, which outranks Helium 10 estimates. Two modes: (1) research/launch — pass asins (the ASINs you will advertise; Amazon may refuse ASINs you don't sell) and keywords; (2) live — pass campaign_id + ad_group_id and keywords. Optional price gives the expected ACOS at 8% and 5.24% CVR for each suggested bid, and every row is checked against the bid cap.",
+			inputSchema: z.object({
+				keywords: z.array(z.string()).min(1).max(100),
+				asins: z.array(z.string()).optional().describe("Mode 1: ASINs to advertise."),
+				campaign_id: z.string().optional().describe("Mode 2 with ad_group_id."),
+				ad_group_id: z.string().optional(),
+				price: z.number().optional().describe("Selling price, to compute expected ACOS."),
+			}),
+		},
+		async ({ keywords, asins, campaign_id, ad_group_id, price }: any) => {
+			try {
+				const { maxBid } = adsLimits();
+				const kws = [...new Set(keywords.map(cleanKeyword).filter(Boolean))] as string[];
+				const targetingExpressions = kws.map((k) => ({ type: "KEYWORD_EXACT_MATCH", value: k }));
+				let body: any;
+				if (ad_group_id && campaign_id) {
+					body = { recommendationType: "BIDS_FOR_EXISTING_AD_GROUP", campaignId: String(campaign_id), adGroupId: String(ad_group_id), targetingExpressions };
+				} else if (asins?.length) {
+					body = { recommendationType: "BIDS_FOR_NEW_AD_GROUP", asins: asins.map((a: string) => a.trim().toUpperCase()), targetingExpressions, bidding: { strategy: "LEGACY_FOR_SALES" } };
+				} else {
+					return errorResult(new Error("Pass either asins, or campaign_id + ad_group_id."));
+				}
+
+				const { out, type } = await adsPostVersioned(
+					"/sp/targets/bid/recommendations",
+					["application/vnd.spthemebasedbidrecommendation.v4+json", "application/vnd.spthemebasedbidrecommendation.v3+json"],
+					body
+				);
+
+				const themes: any[] = out.bidRecommendations || out.themes || (Array.isArray(out) ? out : []);
+				const result = themes.map((th: any) => ({
+					theme: th.theme,
+					impact: th.impactMetrics,
+					keywords: (th.bidRecommendationsForTargetingExpressions || []).map((r: any) => {
+						const vals = (r.bidValues || []).map(bidOf).filter((v: any) => v != null).sort((a: number, b: number) => a - b);
+						const low = vals[0] ?? null;
+						const mid = vals.length ? vals[Math.floor(vals.length / 2)] : null;
+						const high = vals[vals.length - 1] ?? null;
+						const row: any = {
+							keyword: r.targetingExpression?.value,
+							match: r.targetingExpression?.type,
+							low: low != null ? money(low) : null,
+							suggested: mid != null ? money(mid) : null,
+							high: high != null ? money(high) : null,
+							vs_cap: mid == null ? null : mid <= maxBid ? "OK — under $" + money(maxBid) : "ABOVE CAP $" + money(maxBid),
+						};
+						if (price && mid != null) {
+							row.acos_at_8pct_cvr = pct(mid / (0.08 * price));
+							row.acos_at_5_24pct_cvr = pct(mid / (0.0524 * price));
+						}
+						return row;
+					}),
+				}));
+
+				return textResult({
+					source: "Amazon Ads bid recommendations (" + type.replace("application/vnd.", "") + ")",
+					bid_cap: money(maxBid),
+					themes: result,
+					raw_if_unparsed: result.length ? undefined : out,
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_keyword_recommendations",
+		{
+			description:
+				"Amazon's OWN keyword suggestions for one or more ASINs, ranked by Amazon, with suggested exact-match bid ranges and search-term impression rank/share where Amazon provides them. First-party alternative to Cerebro keyword lists. Amazon may only accept ASINs you sell.",
+			inputSchema: z.object({
+				asins: z.array(z.string()).min(1).max(50),
+				max_results: z.number().optional().describe("Default 100, max 200."),
+			}),
+		},
+		async ({ asins, max_results }: any) => {
+			try {
+				const { maxBid } = adsLimits();
+				const max = Math.max(1, Math.min(max_results ?? 100, 200));
+				const base = {
+					recommendationType: "KEYWORDS_FOR_ASINS",
+					asins: asins.map((a: string) => a.trim().toUpperCase()),
+					maxRecommendations: max,
+					sortDimension: "CLICKS",
+					locale: "en_US",
+				};
+				let out: any, type = "";
+				try {
+					({ out, type } = await adsPostVersioned(
+						"/sp/targets/keywords/recommendations",
+						["application/vnd.spkeywordsrecommendation.v5+json", "application/vnd.spkeywordsrecommendation.v4+json"],
+						{ ...base, biddingStrategy: "LEGACY_FOR_SALES", bidsEnabled: true }
+					));
+				} catch (e: any) {
+					if (!/ 4\d\d/.test(String(e?.message || e))) throw e;
+					try {
+						({ out, type } = await adsPostVersioned("/sp/targets/keywords/recommendations", ["application/vnd.spkeywordsrecommendation.v3+json"], base));
+					} catch (e3: any) {
+						throw new Error(String(e?.message || e) + " | v3 retry: " + String(e3?.message || e3));
+					}
+				}
+
+				const list: any[] = out.keywordTargetList || out.recommendations || (Array.isArray(out) ? out : []);
+				const rows = list.map((k: any) => {
+					const infos: any[] = k.bidInfo || [];
+					const exact = infos.find((b) => String(b.matchType).toUpperCase() === "EXACT") || infos[0] || k;
+					const sb = exact.suggestedBid || {};
+					const mid = bidOf(sb.rangeMedian ?? exact.bid ?? exact.suggestedBid);
+					return {
+						keyword: k.keyword ?? k.keywordText,
+						rank: exact.rank ?? k.rank,
+						suggested_exact_bid: mid != null ? money(mid) : null,
+						range: sb.rangeStart != null ? money(Number(sb.rangeStart)) + "–" + money(Number(sb.rangeEnd)) : undefined,
+						vs_cap: mid == null ? null : mid <= maxBid ? "OK" : "ABOVE CAP",
+						impression_rank: k.searchTermImpressionRank,
+						impression_share: k.searchTermImpressionShare,
+					};
+				});
+				return textResult({
+					source: "Amazon Ads keyword recommendations (" + type.replace("application/vnd.", "") + ")",
+					bid_cap: money(maxBid),
+					count: rows.length,
+					keywords: rows,
+					raw_if_unparsed: rows.length ? undefined : out,
+				});
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_other_campaigns",
+		{
+			description:
+				"READ ONLY. Sponsored Brands (headline/video) and Sponsored Display campaigns, plus portfolios. Your rules run Sponsored Products only, so these tools never create or change SB/SD campaigns. Each section reports its own error if Amazon refuses it.",
+			inputSchema: z.object({
+				include_archived: z.boolean().optional(),
+			}),
+		},
+		async ({ include_archived }: any) => {
+			const states = include_archived ? ["ENABLED", "PAUSED", "ARCHIVED"] : ["ENABLED", "PAUSED"];
+			const section = async (fn: () => Promise<any>) => {
+				try {
+					return await fn();
+				} catch (e: any) {
+					return { error: String(e?.message || e).slice(0, 400) };
+				}
+			};
+			const [sb, sd, portfolios] = await Promise.all([
+				section(async () => {
+					const items = await adsList("/sb/v4/campaigns/list", "application/vnd.sbcampaignresource.v4+json", "campaigns", {
+						stateFilter: { include: states },
+					});
+					return items.map((c: any) => ({
+						campaignId: c.campaignId,
+						name: c.name,
+						state: c.state,
+						budget: c.budget,
+						budgetType: c.budgetType,
+						startDate: c.startDate,
+						goal: c.goal,
+						brandEntityId: c.brandEntityId,
+					}));
+				}),
+				section(async () => {
+					const items = await adsRequest("GET", "/sd/campaigns?stateFilter=" + states.map((s) => s.toLowerCase()).join(","));
+					return (Array.isArray(items) ? items : []).map((c: any) => ({
+						campaignId: c.campaignId,
+						name: c.name,
+						state: c.state,
+						tactic: c.tactic,
+						budget: c.budget,
+						costType: c.costType,
+						startDate: c.startDate,
+					}));
+				}),
+				section(async () => {
+					try {
+						return await adsList("/portfolios/list", "application/vnd.spPortfolio.v3+json", "portfolios", {});
+					} catch {
+						return await adsRequest("GET", "/v2/portfolios");
+					}
+				}),
+			]);
+			return textResult({ sponsored_brands: sb, sponsored_display: sd, portfolios });
+		}
+	);
+
+	server.registerTool(
+		"ads_budget_usage",
+		{
+			description:
+				"How much of today's daily budget each Sponsored Products campaign has used (percent, with Amazon's update time). Campaigns that hit 100% early in the day are running out of budget. Pass campaign_ids, or omit to check every enabled campaign.",
+			inputSchema: z.object({
+				campaign_ids: z.array(z.string()).optional(),
+			}),
+		},
+		async ({ campaign_ids }: any) => {
+			try {
+				let ids: string[] = (campaign_ids || []).map(String);
+				if (!ids.length) {
+					const live = await adsList("/sp/campaigns/list", ADS_TYPE.campaign, "campaigns", { stateFilter: { include: ["ENABLED"] } });
+					ids = live.map((c: any) => String(c.campaignId));
+				}
+				if (!ids.length) return textResult({ note: "No enabled campaigns — nothing is spending." });
+				const out = await adsRequest("POST", "/sp/campaigns/budget/usage", { body: { campaignIds: ids.slice(0, 100) } });
+				return textResult(out);
+			} catch (e) {
+				return errorResult(e);
+			}
+		}
+	);
+
+	server.registerTool(
+		"ads_change_history",
+		{
+			description:
+				"Change history: what changed on campaigns, ad groups, keywords and product ads (budgets, bids, states), when, and the before/after values. Use it to check what was changed by hand in the Ads console. Amazon keeps a limited window (roughly 90 days).",
+			inputSchema: z.object({
+				days: z.number().optional().describe("How far back. Default 30, max 90."),
+				max_events: z.number().optional().describe("Default 200."),
+			}),
+		},
+		async ({ days, max_events }: any) => {
+			try {
+				const d = Math.max(1, Math.min(days ?? 30, 90));
+				const out = await adsRequest("POST", "/history", {
+					body: {
+						fromDate: Date.now() - d * 86400000,
+						toDate: Date.now(),
+						eventTypes: { CAMPAIGN: {}, AD_GROUP: {}, KEYWORD: {}, AD: {} },
+						count: Math.max(1, Math.min(max_events ?? 200, 200)),
+						sort: { key: "DATE", direction: "DESC" },
+					},
+				});
+				const events: any[] = out.events || [];
+				return textResult({
+					days: d,
+					count: events.length,
+					events: events.map((ev: any) => ({
+						when: ev.timestamp ? new Date(Number(ev.timestamp)).toISOString() : undefined,
+						entity: ev.entityType,
+						id: ev.entityId,
+						change: ev.changeType,
+						from: ev.previousValue,
+						to: ev.newValue,
+						details: ev.metadata,
+					})),
+					nextToken: out.nextToken,
+				});
 			} catch (e) {
 				return errorResult(e);
 			}
